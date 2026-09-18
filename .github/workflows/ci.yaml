@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths: &paths
+      - .github/workflows/ci.yaml
+      - "**.go"
+      - docker-bake.hcl
+      - Dockerfile
+      - go.mod
+      - go.sum
+      - scripts/**
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths: *paths
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Test
+        uses: docker/bake-action@v7
+        with:
+          source: .
+          targets: test
+          set: |
+            *.platform=linux/amd64
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max

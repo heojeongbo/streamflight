@@ -1,0 +1,8 @@
+/.devcontainer/
+/.git/
+/.github/
+
+/.dockerignore
+/.gitignore
+/cover.out
+/docker-bake.hcl

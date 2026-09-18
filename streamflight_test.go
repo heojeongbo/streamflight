@@ -1,0 +1,975 @@
+package streamflight_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/heojeongbo/streamflight"
+)
+
+// recorder is a Source that logs every open and stop and keeps the Emitter of
+// each open key.
+type recorder struct {
+	mu       sync.Mutex
+	log      []string
+	emitters map[string]streamflight.Emitter[int]
+
+	openErr error
+	stopErr error
+	nilStop bool
+}
+
+func newRecorder() *recorder {
+	return &recorder{emitters: map[string]streamflight.Emitter[int]{}}
+}
+
+func (r *recorder) Source(key string, e streamflight.Emitter[int]) (func() error, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.log = append(r.log, "open "+key)
+	if r.openErr != nil {
+		return nil, r.openErr
+	}
+	r.emitters[key] = e
+	if r.nilStop {
+		return nil, nil
+	}
+	return func() error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.log = append(r.log, "stop "+key)
+		return r.stopErr
+	}, nil
+}
+
+func (r *recorder) emitter(key string) streamflight.Emitter[int] {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.emitters[key]
+}
+
+func (r *recorder) emit(key string, vs ...int) int {
+	n := 0
+	for _, v := range vs {
+		n = r.emitter(key).Emit(v)
+	}
+	return n
+}
+
+func (r *recorder) Log() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.log...)
+}
+
+func (r *recorder) set(f func(r *recorder)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	f(r)
+}
+
+// collector is a SubscribeFunc function that keeps what it receives.
+type collector struct {
+	mu sync.Mutex
+	vs []int
+}
+
+func (c *collector) Add(v int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.vs = append(c.vs, v)
+}
+
+func (c *collector) Values() []int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]int(nil), c.vs...)
+}
+
+// drain reads what is queued on a closed or idle channel without waiting.
+func drain(c <-chan int) []int {
+	vs := []int{}
+	for {
+		select {
+		case v, ok := <-c:
+			if !ok {
+				return vs
+			}
+			vs = append(vs, v)
+		default:
+			return vs
+		}
+	}
+}
+
+func closed(c <-chan int) bool {
+	select {
+	case _, ok := <-c:
+		return !ok
+	default:
+		return false
+	}
+}
+
+func TestSharing(t *testing.T) {
+	t.Run("subscribers of a key share one upstream", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		var a, b collector
+		sa, err := g.SubscribeFunc("k", a.Add)
+		x.NoError(err)
+		sb, err := g.SubscribeFunc("k", b.Add)
+		x.NoError(err)
+
+		x.Equal(2, r.emit("k", 1))
+		x.Equal([]int{1}, a.Values())
+		x.Equal([]int{1}, b.Values())
+		x.Equal([]string{"open k"}, r.Log())
+
+		x.NoError(sa.Close())
+		x.Equal([]string{"open k"}, r.Log(), "a subscriber remains")
+		x.NoError(sb.Close())
+		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
+	t.Run("concurrent subscribers open the upstream once", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		const n = 64
+		subs := make([]*streamflight.Subscription[int], n)
+		errs := make([]error, n)
+		var wg sync.WaitGroup
+		for i := range subs {
+			wg.Go(func() { subs[i], errs[i] = g.Subscribe("k") })
+		}
+		wg.Wait()
+		for _, err := range errs {
+			x.NoError(err)
+		}
+		x.Equal([]string{"open k"}, r.Log())
+
+		x.Equal(n, r.emit("k", 7))
+		for _, s := range subs {
+			x.Equal(7, <-s.C)
+			x.NoError(s.Close())
+		}
+		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
+	t.Run("keys are independent", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		var a, b collector
+		sa, err := g.SubscribeFunc("a", a.Add)
+		x.NoError(err)
+		sb, err := g.SubscribeFunc("b", b.Add)
+		x.NoError(err)
+
+		r.emit("a", 1)
+		r.emit("b", 2)
+		x.Equal([]int{1}, a.Values())
+		x.Equal([]int{2}, b.Values())
+
+		x.NoError(sa.Close())
+		x.Equal([]string{"open a", "open b", "stop a"}, r.Log())
+		x.NoError(sb.Close())
+	})
+	t.Run("the key is forgotten once stopped", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		x.NoError(s.Close())
+
+		s, err = g.Subscribe("k")
+		x.NoError(err)
+		x.NoError(s.Close())
+		x.Equal([]string{"open k", "stop k", "open k", "stop k"}, r.Log())
+	})
+	t.Run("a nil stop means nothing to stop", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		r.nilStop = true
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		x.NoError(s.Close())
+		x.Equal([]string{"open k"}, r.Log())
+	})
+}
+
+func TestOpenAndStopErrors(t *testing.T) {
+	t.Run("an open error is returned and nothing is left behind", func(t *testing.T) {
+		x := require.New(t)
+		boom := errors.New("boom")
+		r := newRecorder()
+		r.openErr = boom
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.SubscribeFunc("k", func(int) { x.Fail("delivered to a failed subscribe") })
+		x.ErrorIs(err, boom)
+		x.Nil(s)
+
+		s, err = g.Subscribe("k")
+		x.ErrorIs(err, boom)
+		x.Nil(s)
+
+		r.set(func(r *recorder) { r.openErr = nil })
+		s, err = g.Subscribe("k")
+		x.NoError(err)
+		x.NoError(s.Close())
+		x.Equal([]string{"open k", "open k", "open k", "stop k"}, r.Log())
+	})
+	t.Run("the last close reports the stop error, every time", func(t *testing.T) {
+		x := require.New(t)
+		boom := errors.New("boom")
+		r := newRecorder()
+		r.stopErr = boom
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		a, err := g.Subscribe("k")
+		x.NoError(err)
+		b, err := g.Subscribe("k")
+		x.NoError(err)
+
+		x.NoError(a.Close())
+		x.NoError(a.Close(), "idempotent: releases one reference only")
+		x.ErrorIs(b.Close(), boom)
+		x.ErrorIs(b.Close(), boom)
+		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
+}
+
+func TestSubscription(t *testing.T) {
+	t.Run("Err says why it ended", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		x.NoError(s.Err())
+		select {
+		case <-s.Done():
+			x.Fail("done while live")
+		default:
+		}
+
+		x.NoError(s.Close())
+		<-s.Done()
+		x.ErrorIs(s.Err(), streamflight.ErrClosed)
+		x.True(closed(s.C))
+	})
+	t.Run("a function subscription has no channel", func(t *testing.T) {
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{Source: newRecorder().Source}
+
+		s, err := g.SubscribeFunc("k", func(int) {})
+		x.NoError(err)
+		x.Nil(s.C)
+		x.NoError(s.Close())
+		x.ErrorIs(s.Err(), streamflight.ErrClosed)
+	})
+	t.Run("the queue holds at least one value", func(t *testing.T) {
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{Source: newRecorder().Source}
+
+		s, err := g.Subscribe("k", streamflight.WithBuffer(0))
+		x.NoError(err)
+		x.Equal(1, cap(s.C))
+		x.NoError(s.Close())
+
+		s, err = g.Subscribe("k", streamflight.WithBuffer(8))
+		x.NoError(err)
+		x.Equal(8, cap(s.C))
+		x.NoError(s.Close())
+	})
+	t.Run("what was queued is still read after close", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.Subscribe("k", streamflight.WithBuffer(4))
+		x.NoError(err)
+		r.emit("k", 1, 2)
+		x.NoError(s.Close())
+
+		x.Equal([]int{1, 2}, drain(s.C))
+		x.True(closed(s.C))
+	})
+}
+
+func TestOverflow(t *testing.T) {
+	t.Run("DropOldest keeps the newest values", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		var dropped []int
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Hooks: streamflight.Hooks[string, int]{
+				Dropped: func(_ string, v int) { dropped = append(dropped, v) },
+			},
+		}
+
+		s, err := g.Subscribe("k", streamflight.WithBuffer(2))
+		x.NoError(err)
+		for v := 1; v <= 5; v++ {
+			x.Equal(1, r.emit("k", v), "the arriving value is accepted")
+		}
+		x.Equal([]int{4, 5}, drain(s.C))
+		x.Equal(uint64(3), s.Dropped())
+		x.Equal([]int{1, 2, 3}, dropped, "the displaced values")
+		x.NoError(s.Close())
+	})
+	t.Run("DropNewest keeps the oldest values", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		var dropped []int
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Hooks: streamflight.Hooks[string, int]{
+				Dropped: func(_ string, v int) { dropped = append(dropped, v) },
+			},
+		}
+
+		s, err := g.Subscribe("k", streamflight.WithBuffer(2), streamflight.WithOverflow(streamflight.DropNewest))
+		x.NoError(err)
+		x.Equal(1, r.emit("k", 1))
+		x.Equal(1, r.emit("k", 2))
+		x.Equal(0, r.emit("k", 3), "the arriving value is refused")
+		x.Equal(0, r.emit("k", 4))
+		x.Equal([]int{1, 2}, drain(s.C))
+		x.Equal(uint64(2), s.Dropped())
+		x.Equal([]int{3, 4}, dropped)
+		x.NoError(s.Close())
+	})
+	t.Run("Evict cuts off a subscriber that falls behind, and only it", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		slow, err := g.Subscribe("k", streamflight.WithOverflow(streamflight.Evict))
+		x.NoError(err)
+		var fast collector
+		sf, err := g.SubscribeFunc("k", fast.Add)
+		x.NoError(err)
+
+		x.Equal(2, r.emit("k", 1))
+		x.Equal(1, r.emit("k", 2), "slow is full and is evicted")
+		x.Equal(1, r.emit("k", 3))
+
+		<-slow.Done()
+		x.ErrorIs(slow.Err(), streamflight.ErrEvicted)
+		x.Equal([]int{1}, drain(slow.C))
+		x.Equal([]int{1, 2, 3}, fast.Values())
+
+		x.NoError(sf.Close())
+		x.Equal([]string{"open k"}, r.Log(), "an evicted subscription still holds the upstream")
+		x.NoError(slow.Close())
+		x.ErrorIs(slow.Err(), streamflight.ErrEvicted, "close does not rewrite why it ended")
+		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
+	t.Run("Block waits for the subscriber to make room", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			g := &streamflight.Group[string, int]{Source: r.Source}
+
+			s, err := g.Subscribe("k", streamflight.WithOverflow(streamflight.Block))
+			x.NoError(err)
+			x.Equal(1, r.emit("k", 1))
+
+			var n atomic.Int64
+			go func() { n.Store(int64(r.emit("k", 2))) }()
+			synctest.Wait()
+			x.Equal(int64(0), n.Load(), "still waiting")
+
+			x.Equal(1, <-s.C)
+			synctest.Wait()
+			x.Equal(int64(1), n.Load())
+			x.Equal(2, <-s.C)
+			x.NoError(s.Close())
+		})
+	})
+	t.Run("Block is released by closing the subscription", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			g := &streamflight.Group[string, int]{Source: r.Source}
+
+			s, err := g.Subscribe("k", streamflight.WithOverflow(streamflight.Block))
+			x.NoError(err)
+			r.emit("k", 1)
+
+			n := make(chan int)
+			go func() { n <- r.emit("k", 2) }()
+			synctest.Wait()
+
+			x.NoError(s.Close())
+			x.Equal(0, <-n)
+			x.Equal([]string{"open k", "stop k"}, r.Log())
+		})
+	})
+	t.Run("Block is released by closing the group", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			g := &streamflight.Group[string, int]{Source: r.Source}
+
+			s, err := g.Subscribe("k", streamflight.WithOverflow(streamflight.Block))
+			x.NoError(err)
+			r.emit("k", 1)
+
+			n := make(chan int)
+			go func() { n <- r.emit("k", 2) }()
+			synctest.Wait()
+
+			x.NoError(g.Close())
+			x.Equal(0, <-n)
+			x.ErrorIs(s.Err(), streamflight.ErrGroupClosed)
+			x.NoError(s.Close())
+		})
+	})
+	t.Run("Block is released by the upstream ending", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			g := &streamflight.Group[string, int]{Source: r.Source}
+
+			s, err := g.Subscribe("k", streamflight.WithOverflow(streamflight.Block))
+			x.NoError(err)
+			r.emit("k", 1)
+
+			n := make(chan int)
+			go func() { n <- r.emit("k", 2) }()
+			synctest.Wait()
+
+			r.emitter("k").End(nil)
+			x.Equal(0, <-n)
+			x.ErrorIs(s.Err(), io.EOF)
+			x.NoError(s.Close())
+		})
+	})
+}
+
+func TestReplay(t *testing.T) {
+	t.Run("a joining subscriber first receives the latest values, oldest first", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source, Replay: 2}
+
+		first, err := g.Subscribe("k", streamflight.WithBuffer(8))
+		x.NoError(err)
+		x.Empty(drain(first.C), "nothing to replay yet")
+		r.emit("k", 1, 2, 3)
+
+		var late collector
+		sl, err := g.SubscribeFunc("k", late.Add)
+		x.NoError(err)
+		x.Equal([]int{2, 3}, late.Values())
+
+		r.emit("k", 4)
+		x.Equal([]int{2, 3, 4}, late.Values())
+		x.Equal([]int{1, 2, 3, 4}, drain(first.C), "replay reaches only the joiner")
+
+		x.NoError(first.Close())
+		x.NoError(sl.Close())
+	})
+	t.Run("a short queue keeps the newest replayed values without blocking", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source, Replay: 3}
+
+		keep, err := g.SubscribeFunc("k", func(int) {})
+		x.NoError(err)
+		r.emit("k", 1, 2, 3)
+
+		s, err := g.Subscribe("k", streamflight.WithOverflow(streamflight.Block))
+		x.NoError(err)
+		x.Equal([]int{3}, drain(s.C))
+
+		x.NoError(s.Close())
+		x.NoError(keep.Close())
+	})
+	t.Run("a value emitted while opening is replayed to the opener", func(t *testing.T) {
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{
+			Source: func(key string, e streamflight.Emitter[int]) (func() error, error) {
+				x.Equal(0, e.Emit(42), "no subscriber is attached yet")
+				return nil, nil
+			},
+			Replay: 1,
+		}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		x.Equal(42, <-s.C)
+		x.NoError(s.Close())
+	})
+	t.Run("nothing is replayed without Replay", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		keep, err := g.SubscribeFunc("k", func(int) {})
+		x.NoError(err)
+		r.emit("k", 1)
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		x.Empty(drain(s.C))
+
+		x.NoError(s.Close())
+		x.NoError(keep.Close())
+	})
+}
+
+func TestInitial(t *testing.T) {
+	t.Run("a joining subscriber alone receives what Initial sends, after the replay", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		state := 0
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Replay: 1,
+			Initial: func(key string, send func(int)) {
+				x.Equal("k", key)
+				send(100 + state)
+			},
+		}
+
+		var first collector
+		sf, err := g.SubscribeFunc("k", first.Add)
+		x.NoError(err)
+		x.Equal([]int{100}, first.Values())
+
+		state = 1
+		r.emit("k", 1)
+
+		var late collector
+		sl, err := g.SubscribeFunc("k", late.Add)
+		x.NoError(err)
+		x.Equal([]int{1, 101}, late.Values())
+		x.Equal([]int{100, 1}, first.Values())
+
+		x.NoError(sf.Close())
+		x.NoError(sl.Close())
+	})
+}
+
+func TestLinger(t *testing.T) {
+	t.Run("the upstream stops once it has lingered", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			g := &streamflight.Group[string, int]{Source: r.Source, Linger: time.Second}
+
+			s, err := g.Subscribe("k")
+			x.NoError(err)
+			x.NoError(s.Close())
+			x.Equal([]string{"open k"}, r.Log())
+
+			time.Sleep(time.Second)
+			synctest.Wait()
+			x.Equal([]string{"open k", "stop k"}, r.Log())
+		})
+	})
+	t.Run("a subscriber that comes back in time reuses the upstream", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			g := &streamflight.Group[string, int]{Source: r.Source, Linger: time.Second, Replay: 1}
+
+			s, err := g.Subscribe("k")
+			x.NoError(err)
+			x.NoError(s.Close())
+
+			time.Sleep(time.Second / 2)
+			r.emit("k", 7)
+			s, err = g.Subscribe("k")
+			x.NoError(err)
+			x.Equal(7, <-s.C, "a value emitted while lingering is replayed")
+
+			time.Sleep(2 * time.Second)
+			synctest.Wait()
+			x.Equal([]string{"open k"}, r.Log(), "the linger was disarmed")
+
+			x.NoError(s.Close())
+			time.Sleep(time.Second)
+			synctest.Wait()
+			x.Equal([]string{"open k", "stop k"}, r.Log())
+		})
+	})
+	t.Run("closing the group stops a lingering upstream", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			g := &streamflight.Group[string, int]{Source: r.Source, Linger: time.Second}
+
+			s, err := g.Subscribe("k")
+			x.NoError(err)
+			x.NoError(s.Close())
+			x.NoError(g.Close())
+			x.Equal([]string{"open k", "stop k"}, r.Log())
+
+			time.Sleep(2 * time.Second)
+			synctest.Wait()
+			x.Equal([]string{"open k", "stop k"}, r.Log(), "stopped once")
+		})
+	})
+	t.Run("an upstream that ended does not linger", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source, Linger: time.Hour}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		r.emitter("k").End(nil)
+		x.NoError(s.Close())
+		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
+}
+
+func TestEnd(t *testing.T) {
+	t.Run("ending closes every subscriber with the error", func(t *testing.T) {
+		x := require.New(t)
+		boom := errors.New("boom")
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		a, err := g.Subscribe("k", streamflight.WithBuffer(4))
+		x.NoError(err)
+		var b collector
+		sb, err := g.SubscribeFunc("k", b.Add)
+		x.NoError(err)
+
+		e := r.emitter("k")
+		e.Emit(1)
+		e.End(boom)
+		x.Equal(0, e.Emit(2), "emit after end does nothing")
+		e.End(errors.New("ignored"))
+
+		<-a.Done()
+		x.ErrorIs(a.Err(), boom)
+		x.ErrorIs(sb.Err(), boom)
+		x.Equal([]int{1}, drain(a.C))
+		x.True(closed(a.C))
+		x.Equal([]int{1}, b.Values())
+
+		x.NoError(a.Close())
+		x.Equal([]string{"open k"}, r.Log(), "stopped once every subscriber has closed")
+		x.NoError(sb.Close())
+		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
+	t.Run("a nil error ends with io.EOF", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		r.emitter("k").End(nil)
+		x.ErrorIs(s.Err(), io.EOF)
+		x.NoError(s.Close())
+	})
+	t.Run("the next subscriber opens a fresh upstream after stopping the old one", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		old, err := g.Subscribe("k")
+		x.NoError(err)
+		r.emitter("k").End(nil)
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		x.Equal([]string{"open k", "stop k", "open k"}, r.Log())
+		x.NoError(s.Err())
+
+		x.NoError(old.Close(), "the old upstream is already stopped")
+		x.Equal([]string{"open k", "stop k", "open k"}, r.Log())
+		x.NoError(s.Close())
+		x.Equal([]string{"open k", "stop k", "open k", "stop k"}, r.Log())
+	})
+	t.Run("an upstream that ends while opening ends its first subscriber", func(t *testing.T) {
+		x := require.New(t)
+		boom := errors.New("boom")
+		stops := 0
+		g := &streamflight.Group[string, int]{
+			Source: func(key string, e streamflight.Emitter[int]) (func() error, error) {
+				e.End(boom)
+				return func() error { stops++; return nil }, nil
+			},
+		}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		<-s.Done()
+		x.ErrorIs(s.Err(), boom)
+		x.NoError(s.Close())
+		x.Equal(1, stops)
+	})
+	t.Run("an upstream that ends and then fails to open is not stopped", func(t *testing.T) {
+		x := require.New(t)
+		boom := errors.New("boom")
+		stopped := false
+		g := &streamflight.Group[string, int]{
+			Source: func(key string, e streamflight.Emitter[int]) (func() error, error) {
+				e.End(nil)
+				return func() error { stopped = true; return nil }, boom
+			},
+		}
+
+		_, err := g.Subscribe("k")
+		x.ErrorIs(err, boom)
+		x.False(stopped)
+	})
+}
+
+func TestGroupClose(t *testing.T) {
+	t.Run("closing the group stops every upstream and ends every subscription", func(t *testing.T) {
+		x := require.New(t)
+		boom := errors.New("boom")
+		r := newRecorder()
+		r.stopErr = boom
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		a, err := g.Subscribe("a")
+		x.NoError(err)
+		b, err := g.Subscribe("b")
+		x.NoError(err)
+
+		err = g.Close()
+		x.ErrorIs(err, boom)
+		x.ElementsMatch([]string{"open a", "open b", "stop a", "stop b"}, r.Log())
+		x.ErrorIs(a.Err(), streamflight.ErrGroupClosed)
+		x.ErrorIs(b.Err(), streamflight.ErrGroupClosed)
+		x.True(closed(a.C))
+
+		x.NoError(g.Close(), "idempotent")
+		x.NoError(a.Close(), "already stopped")
+		x.NoError(b.Close())
+		x.Len(r.Log(), 4)
+
+		_, err = g.Subscribe("a")
+		x.ErrorIs(err, streamflight.ErrGroupClosed)
+		_, err = g.SubscribeFunc("a", func(int) {})
+		x.ErrorIs(err, streamflight.ErrGroupClosed)
+	})
+	t.Run("closing an empty group", func(t *testing.T) {
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{Source: newRecorder().Source}
+		x.NoError(g.Close())
+	})
+}
+
+func TestHooks(t *testing.T) {
+	x := require.New(t)
+	boom := errors.New("boom")
+	r := newRecorder()
+
+	var log []string
+	g := &streamflight.Group[string, int]{
+		Source: r.Source,
+		Hooks: streamflight.Hooks[string, int]{
+			Opened:  func(key string, err error) { log = append(log, fmt.Sprintf("opened %s %v", key, err)) },
+			Stopped: func(key string, err error) { log = append(log, fmt.Sprintf("stopped %s %v", key, err)) },
+			Joined:  func(key string, n int) { log = append(log, fmt.Sprintf("joined %s %d", key, n)) },
+			Left:    func(key string, n int) { log = append(log, fmt.Sprintf("left %s %d", key, n)) },
+			Dropped: func(key string, v int) { log = append(log, fmt.Sprintf("dropped %s %d", key, v)) },
+		},
+	}
+
+	a, err := g.Subscribe("k")
+	x.NoError(err)
+	b, err := g.Subscribe("k")
+	x.NoError(err)
+	r.emit("k", 1, 2)
+	x.NoError(a.Close())
+	x.NoError(b.Close())
+
+	r.set(func(r *recorder) { r.openErr = boom })
+	_, err = g.Subscribe("k")
+	x.ErrorIs(err, boom)
+
+	x.Equal([]string{
+		"opened k <nil>",
+		"joined k 1",
+		"joined k 2",
+		"dropped k 1",
+		"dropped k 1",
+		"left k 1",
+		"left k 0",
+		"stopped k <nil>",
+		"opened k boom",
+	}, log)
+}
+
+func TestDelivery(t *testing.T) {
+	t.Run("a subscriber is never delivered to concurrently", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		var inflight atomic.Int32
+		var overlapped atomic.Bool
+		total := 0 // unsynchronized on purpose: the race detector flags concurrent deliveries
+		s, err := g.SubscribeFunc("k", func(int) {
+			if inflight.Add(1) > 1 {
+				overlapped.Store(true)
+			}
+			total++
+			inflight.Add(-1)
+		})
+		x.NoError(err)
+
+		const emitters, each = 8, 1000
+		e := r.emitter("k")
+		var wg sync.WaitGroup
+		for range emitters {
+			wg.Go(func() {
+				for range each {
+					e.Emit(1)
+				}
+			})
+		}
+		wg.Wait()
+
+		x.False(overlapped.Load())
+		x.Equal(emitters*each, total)
+		x.NoError(s.Close())
+	})
+	t.Run("nothing is delivered after close returns", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		var kept atomic.Int64
+		keep, err := g.SubscribeFunc("k", func(int) { kept.Add(1) })
+		x.NoError(err)
+
+		var closedAt, late atomic.Bool
+		s, err := g.SubscribeFunc("k", func(int) {
+			if closedAt.Load() {
+				late.Store(true)
+			}
+		})
+		x.NoError(err)
+
+		e := r.emitter("k")
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					e.Emit(1)
+				}
+			}
+		}()
+
+		for kept.Load() < 100 {
+			time.Sleep(time.Microsecond)
+		}
+		x.NoError(s.Close())
+		closedAt.Store(true)
+
+		target := kept.Load() + 1000
+		for kept.Load() < target {
+			time.Sleep(time.Microsecond)
+		}
+		close(stop)
+		<-done
+
+		x.False(late.Load())
+		x.NoError(keep.Close())
+	})
+	t.Run("values arrive in the order they were emitted", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.Subscribe("k", streamflight.WithBuffer(100), streamflight.WithOverflow(streamflight.Block))
+		x.NoError(err)
+		want := make([]int, 100)
+		for i := range want {
+			want[i] = i
+			r.emit("k", i)
+		}
+		x.Equal(want, drain(s.C))
+		x.NoError(s.Close())
+	})
+}
+
+func TestRun(t *testing.T) {
+	t.Run("a poller runs while subscribed and is stopped with its context", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			returned := make(chan error, 1)
+			g := &streamflight.Group[string, int]{
+				Source: streamflight.Run(func(ctx context.Context, key string, e streamflight.Emitter[int]) error {
+					tick := time.NewTicker(time.Second)
+					defer tick.Stop()
+					for i := 1; ; i++ {
+						select {
+						case <-ctx.Done():
+							returned <- ctx.Err()
+							return ctx.Err()
+						case <-tick.C:
+							e.Emit(i)
+						}
+					}
+				}),
+			}
+
+			s, err := g.Subscribe("k", streamflight.WithBuffer(8))
+			x.NoError(err)
+			time.Sleep(3 * time.Second)
+			synctest.Wait()
+			x.Equal([]int{1, 2, 3}, drain(s.C))
+
+			x.NoError(s.Close())
+			x.ErrorIs(<-returned, context.Canceled)
+			x.ErrorIs(s.Err(), streamflight.ErrClosed, "stopping is not an end")
+		})
+	})
+	t.Run("a function that returns ends the upstream with its error", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			boom := errors.New("boom")
+			g := &streamflight.Group[string, int]{
+				Source: streamflight.Run(func(ctx context.Context, key string, e streamflight.Emitter[int]) error {
+					e.Emit(1)
+					return boom
+				}),
+			}
+
+			s, err := g.Subscribe("k", streamflight.WithBuffer(8))
+			x.NoError(err)
+			synctest.Wait()
+			<-s.Done()
+			x.ErrorIs(s.Err(), boom)
+			x.NoError(s.Close())
+		})
+	})
+}

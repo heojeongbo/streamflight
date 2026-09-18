@@ -1,0 +1,22 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: sleep infinity
+
+    user: "1000"
+    environment:
+      - SHELL=/bin/zsh
+
+    volumes:
+      - command.history:/commandhistory
+      - go.cache.mod:/home/hypnos/go/pkg/mod
+      - go.cache.bin:/home/hypnos/.cache/go-build
+
+      - ..:/workspace
+
+volumes:
+  command.history:
+  go.cache.mod:
+  go.cache.bin:
