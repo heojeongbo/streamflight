@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1276,6 +1277,188 @@ func TestDelivery(t *testing.T) {
 		x.Equal(want, drain(s.C))
 		x.NoError(s.Close())
 	})
+}
+
+// upstreams tracks what the Group did to every key, so a soak can assert the
+// lifecycle guarantees rather than just that nothing crashed.
+type upstreams struct {
+	t *testing.T
+
+	mu    sync.Mutex
+	live  map[string]bool
+	opens int
+	stops int
+}
+
+func newUpstreams(t *testing.T) *upstreams {
+	return &upstreams{t: t, live: map[string]bool{}}
+}
+
+// Source emits an increasing counter until it is stopped, and ends by itself
+// every so often so that the take-over-and-re-open path is exercised too.
+func (u *upstreams) Source(key string, e streamflight.Emitter[int]) (func() error, error) {
+	u.mu.Lock()
+	if u.live[key] {
+		u.t.Errorf("two upstreams open at once for %q", key)
+	}
+	u.live[key] = true
+	u.opens++
+	endAfter := 0
+	if u.opens%4 == 0 {
+		endAfter = 5 // this one ends by itself
+	}
+	u.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 1; ; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			if endAfter > 0 && i > endAfter {
+				e.End(io.EOF)
+				return
+			}
+			e.Emit(i)
+			runtime.Gosched()
+		}
+	}()
+
+	return func() error {
+		cancel()
+		<-done // no emitting goroutine outlives its upstream
+
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		if !u.live[key] {
+			u.t.Errorf("upstream of %q stopped twice", key)
+		}
+		u.live[key] = false
+		u.stops++
+		return nil
+	}, nil
+}
+
+// snapshot is what Initial sends in the soak below. Negative so that it cannot
+// be mistaken for one of the counter values an upstream emits.
+const snapshot = -1
+
+// TestMultipleClients is a soak: many clients joining and leaving a small pool
+// of keys at once, in every subscription style, while their upstreams emit,
+// end by themselves and are re-opened underneath them.
+func TestMultipleClients(t *testing.T) {
+	// Without Linger every key that goes idle is stopped and re-opened, which
+	// is the churn the lifecycle guarantees are about. With it, the same clients
+	// mostly rejoin an upstream that is still running.
+	t.Run("without linger", func(t *testing.T) { soak(t, 0) })
+	t.Run("with linger", func(t *testing.T) { soak(t, time.Millisecond) })
+}
+
+func soak(t *testing.T, linger time.Duration) {
+	const (
+		keys    = 6
+		clients = 48
+		rounds  = 60
+	)
+	x := require.New(t)
+	u := newUpstreams(t)
+	g := &streamflight.Group[string, int]{
+		Source: u.Source,
+		Replay: 2,
+		Linger: linger,
+		// A snapshot, not an emitted value: it is sent per subscriber after the
+		// replay, so it is deliberately out of band and excluded below.
+		Initial: func(_ string, send func(int)) { send(snapshot) },
+	}
+
+	// increasing checks the ordering guarantee: a subscriber may lose values to
+	// its Overflow policy, but never sees the ones it gets go backwards. It
+	// applies to emitted values only, which is what the guarantee covers.
+	increasing := func(what string, prev *int, v int) {
+		if v == snapshot {
+			return
+		}
+		if v < *prev {
+			t.Errorf("%s: out of order, %d after %d", what, v, *prev)
+		}
+		*prev = v
+	}
+
+	var wg sync.WaitGroup
+	for c := range clients {
+		wg.Go(func() {
+			for round := range rounds {
+				key := fmt.Sprintf("k%d", (c+round)%keys)
+
+				switch (c + round) % 4 {
+				case 0: // a function subscriber
+					var prev int
+					var after atomic.Bool
+					var late atomic.Bool
+					s, err := g.SubscribeFunc(key, func(v int) {
+						if after.Load() {
+							late.Store(true)
+						}
+						increasing("SubscribeFunc", &prev, v)
+					})
+					if err != nil {
+						return
+					}
+					runtime.Gosched()
+					x.NoError(s.Close())
+					after.Store(true)
+					runtime.Gosched()
+					x.False(late.Load(), "delivered after Close returned")
+
+				default: // a channel subscriber, under each policy
+					// Block included on purpose: a subscriber that stops reading
+					// holds its key's delivery, so this is where a Group that
+					// couples keys together seizes up.
+					policy := []streamflight.Overflow{
+						streamflight.DropOldest, streamflight.DropNewest,
+						streamflight.Evict, streamflight.Block,
+					}[(c+round)%4]
+					s, err := g.Subscribe(key,
+						streamflight.WithBuffer(1+(c+round)%8),
+						streamflight.WithOverflow(policy))
+					if err != nil {
+						return
+					}
+					prev := 0
+					for range 3 {
+						select {
+						case v, ok := <-s.C:
+							if ok {
+								increasing("Subscribe", &prev, v)
+							}
+						default:
+						}
+						runtime.Gosched()
+					}
+					x.NoError(s.Close())
+					for v := range s.C { // what was queued is still readable
+						increasing("Subscribe after close", &prev, v)
+					}
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	x.NoError(g.Close())
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	x.Equal(u.opens, u.stops, "every upstream opened was stopped exactly once")
+	for key, live := range u.live {
+		x.False(live, "upstream of %q still running after Close", key)
+	}
+	t.Logf("%d clients x %d rounds over %d keys: %d upstreams opened and stopped",
+		clients, rounds, keys, u.opens)
 }
 
 func TestRun(t *testing.T) {
