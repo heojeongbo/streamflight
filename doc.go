@@ -54,8 +54,20 @@
 //     A function passed to SubscribeFunc, [Group.Initial] and [Hooks] must not
 //     call back into the Group, and neither may Close be called from inside a
 //     SubscribeFunc function: both deadlock.
-//   - Open, stop and every hook except Dropped run under a lock shared by the
-//     whole Group. Keep them short.
+//   - Open and stop run with no Group lock held, and different keys open and
+//     stop at the same time. A [Source], its stop func and any goroutine they
+//     own may use the Group: they may subscribe to other keys, and may close
+//     any subscription. They must not subscribe to their own key or close the
+//     Group, because a key is held from the moment it starts opening until its
+//     stop func has returned, so either call would wait for itself.
+//   - A stop func must return. Its key is unavailable until it does, and
+//     [Group.Close] waits for it, but no other key is held up by it.
+//   - Subscribe waits while another goroutine is opening or stopping the same
+//     key. It never waits for another key's Source or stop func.
+//   - The Joined and Left hooks run under a lock shared by the whole Group, so
+//     that their counts are reported in order. Keep them short. Opened,
+//     Stopped and Dropped run with no Group lock held, and every hook may run
+//     concurrently for different keys.
 //   - Always Close a Subscription, including one that has already ended. An
 //     upstream is stopped only when all of its subscriptions are closed.
 package streamflight

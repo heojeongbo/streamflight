@@ -83,7 +83,9 @@ type Group[K comparable, T any] struct {
 }
 
 // Hooks observe a Group. Every field is optional. None may call back into the
-// Group.
+// Group, and all of them may be called concurrently for different keys. Joined
+// and Left run under a lock shared by the whole Group, so their counts arrive
+// in order; keep them short.
 type Hooks[K comparable, T any] struct {
 	// Opened is called after the Source of key was called, with its error.
 	Opened func(key K, err error)
@@ -134,6 +136,10 @@ func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error)
 // Close stops every upstream, ends every subscription with ErrGroupClosed and
 // makes later Subscribe calls fail with it. It returns the errors of the stop
 // funcs, joined. Close is idempotent.
+//
+// Close waits for an upstream another goroutine is opening or stopping, and a
+// second Close waits for the first: once any Close returns, every upstream of
+// the Group has been stopped.
 func (g *Group[K, T]) Close() error {
 	g.mu.Lock()
 	if g.closeDone != nil {

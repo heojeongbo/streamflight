@@ -6,6 +6,11 @@ import "context"
 // first subscriber of the key, and must deliver values through e until stop is
 // called. A nil stop means there is nothing to stop.
 //
+// It runs with no Group lock held, so it may take as long as opening really
+// takes without holding up another key, and it may use the Group itself to
+// build one stream out of others; see the package documentation for the two
+// calls it must not make.
+//
 // Values emitted before Source returns reach the subscriber that is opening the
 // key only through [Group.Replay].
 type Source[K comparable, T any] func(key K, e Emitter[T]) (stop func() error, err error)
