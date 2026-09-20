@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.3.0 — 2026-09-20
+
+Three things every consumer was writing by hand, taken from a real one. Purely
+additive: nothing to rewrite, and the only change to the exported surface is
+four new names.
+
+### Added
+
+- **`Subscription.Drain(ctx, send)`** — the body of a handler relaying one key
+  to one client: the select on the context and the channel, the closed-channel
+  case, the send error. `send` is a `func(T) error`, so it is whatever the
+  protocol's write is — gRPC's `Send` fits as a method value, everything else
+  in a two-line closure — and this package stays ignorant of all of them. A
+  write that can block belongs there rather than in `SubscribeFunc`, where it
+  would hold up every other subscriber of the key.
+
+  ```go
+  sub, err := g.Subscribe(key, streamflight.WithBuffer(16))
+  if err != nil {
+      return err
+  }
+  defer sub.Close()
+  return sub.Drain(stream.Context(), stream.Send)
+  ```
+
+- **`Poll(interval, tick)`** — a `Source` from a function called on an
+  interval, for an upstream that is a repeated request rather than a
+  subscription. It fires on open, so a subscriber sees something immediately
+  instead of after one interval, and reschedules an interval after the previous
+  call *returned*. Not a `time.Ticker`: a Ticker keeps the tick a slow call
+  missed and fires again at once, so a call that outruns its interval runs back
+  to back with no idle at all. Pair it with `Replay: 1`, since the first tick
+  runs before the opening subscriber is attached.
+
+- **`Group.ReplayFor`** — `Replay` for one key, replacing it. A topic that wants
+  1 and a stream of events that wants 0 can now share one Group rather than
+  needing one each. It runs with no Group lock held, like `Source`.
+
+- **`ErrPollInterval`** — why opening a key fails when `Poll` was given an
+  interval that is not positive, rather than spinning.
+
+### Fixed
+
+- **A subscription could report no reason for ending.** `end` closed the value
+  channel before `done`, so a reader woken by that close could reach `Err` and
+  find nothing — and ranging over `C` and then asking `Err` is the idiom this
+  README and `ExampleRun` both use. The window never lost the reason in 20000
+  rounds here, but widening it with a single `runtime.Gosched` lost it in 19533
+  of 20000, and none once the two closes were in the other order.
+
+  A consumer selecting on both `Done` and `C` may now observe the end while
+  values are still queued. `C` goes on yielding them.
+
 ## v0.2.0 — 2026-09-20
 
 The Group used one lock for every key, and held it across the user's `Source`
