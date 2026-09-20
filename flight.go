@@ -27,6 +27,10 @@ type flight[K comparable, T any] struct {
 	st    state
 	wait  chan struct{} // closed when f leaves the phase it is in
 
+	// openErr is why this flight never opened. Written under g.mu before wait
+	// is closed, and read only after receiving from it.
+	openErr error
+
 	// ended mirrors done so the Group can tell whether this flight has ended
 	// without waiting for a delivery that is holding mu. Written under mu.
 	ended atomic.Bool

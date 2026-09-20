@@ -951,6 +951,96 @@ func gatedStops(inner streamflight.Source[string, int]) (src streamflight.Source
 	}, in, func() { once.Do(func() { close(gate) }) }
 }
 
+// TestConcurrentOpen pins that a key being opened is not a key being held by
+// the Group: the Source runs with no Group lock held, so other keys carry on,
+// and everyone waiting for this one shares its single attempt.
+func TestConcurrentOpen(t *testing.T) {
+	t.Run("opening one key does not block another", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			gate := make(chan struct{})
+			g := &streamflight.Group[string, int]{
+				Source: func(key string, _ streamflight.Emitter[int]) (func() error, error) {
+					if key == "slow" {
+						<-gate
+					}
+					return nil, nil
+				},
+			}
+
+			go g.Subscribe("slow")
+			synctest.Wait() // parked inside the Source of "slow"
+
+			fast, err := g.Subscribe("fast")
+			x.NoError(err, "a second key opened while the first was still opening")
+			x.NoError(fast.Close())
+
+			close(gate)
+			synctest.Wait()
+			x.NoError(g.Close())
+		})
+	})
+	t.Run("concurrent subscribers share one failed open", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			boom := errors.New("boom")
+			gate := make(chan struct{})
+			opens := 0
+			g := &streamflight.Group[string, int]{
+				Source: func(string, streamflight.Emitter[int]) (func() error, error) {
+					opens++
+					<-gate
+					return nil, boom
+				},
+			}
+
+			const n = 8
+			errs := make([]error, n)
+			var wg sync.WaitGroup
+			for i := range errs {
+				wg.Go(func() { _, errs[i] = g.Subscribe("k") })
+			}
+			synctest.Wait() // one is in the Source, the rest wait on it
+
+			close(gate)
+			wg.Wait()
+			for _, err := range errs {
+				x.ErrorIs(err, boom, "the waiters get the opener's error")
+			}
+			x.Equal(1, opens, "one attempt, shared by all of them")
+
+			// The key was given back, so it can be opened again.
+			x.NoError(g.Close())
+		})
+	})
+	t.Run("closing during an open stops the upstream it opened", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			gate := make(chan struct{})
+			g := &streamflight.Group[string, int]{
+				Source: func(key string, e streamflight.Emitter[int]) (func() error, error) {
+					<-gate
+					return r.Source(key, e)
+				},
+			}
+
+			sub := make(chan error, 1)
+			go func() { _, err := g.Subscribe("k"); sub <- err }()
+			synctest.Wait() // parked inside the Source
+
+			closed := make(chan error, 1)
+			go func() { closed <- g.Close() }()
+			synctest.Wait() // Close is waiting for the open to finish
+
+			close(gate)
+			x.ErrorIs(<-sub, streamflight.ErrGroupClosed)
+			x.NoError(<-closed)
+			x.Equal([]string{"open k", "stop k"}, r.Log(), "what was opened was stopped")
+		})
+	})
+}
+
 // TestConcurrentStop pins that a key being stopped is not a key being held by
 // the Group: the stop func runs with no Group lock held, so everything else
 // carries on, and whoever wants the key next waits for the stop rather than

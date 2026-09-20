@@ -204,29 +204,19 @@ func (g *Group[K, T]) acquire(key K) (*flight[K, T], error) {
 		f := g.flights[key]
 		switch {
 		case f == nil:
+			// Take the key first, then open it with the lock released. Holding
+			// the key is what keeps anyone else from opening it; holding the
+			// lock is not, and would stall every other key for the Source.
 			f = newFlight(g, key)
-			stop, err := g.Source(key, f)
-			if g.Hooks.Opened != nil {
-				g.Hooks.Opened(key, err)
-			}
-			if err != nil {
-				// Nothing to stop, even if the Source ended it before failing,
-				// and nothing in the map to remove.
-				f.st = dead
-				g.mu.Unlock()
-				return nil, err
-			}
-			f.stop = stop
-			f.st = live
 			if g.flights == nil {
 				g.flights = make(map[K]*flight[K, T])
 			}
 			g.flights[key] = f
-			f.refs++
-			if g.Hooks.Joined != nil {
-				g.Hooks.Joined(key, f.refs)
-			}
 			g.mu.Unlock()
+
+			if err := g.open(key, f); err != nil {
+				return nil, err
+			}
 			// Returned without re-reading the state: an upstream that ended
 			// while opening belongs to this subscriber, which attach ends.
 			return f, nil
@@ -237,6 +227,11 @@ func (g *Group[K, T]) acquire(key K) (*flight[K, T], error) {
 			w := f.waitLocked()
 			g.mu.Unlock()
 			<-w
+			if err := f.openErr; err != nil {
+				// Its open failed. Share the error rather than pile a second
+				// attempt onto whatever made the first one fail.
+				return nil, err
+			}
 
 		case f.ended.Load():
 			// Stop an upstream that ended by itself before opening its
@@ -261,6 +256,51 @@ func (g *Group[K, T]) acquire(key K) (*flight[K, T], error) {
 			return f, nil
 		}
 	}
+}
+
+// open runs the Source of f with no lock held and publishes what it returned.
+// f already holds its key, so nobody else opens it and nobody stops it until
+// this returns. On success f is live, with one reference held for the caller.
+func (g *Group[K, T]) open(key K, f *flight[K, T]) (err error) {
+	var stop func() error
+	opened := false
+
+	defer func() {
+		g.mu.Lock()
+		switch {
+		case !opened:
+			// Failed, or the Source panicked: give the key back, so the next
+			// subscriber opens it again rather than waiting on it forever.
+			delete(g.flights, key)
+			f.st = dead
+			f.openErr = err
+		case g.closeDone != nil:
+			// A Close began while this was opening. Publish it unreferenced so
+			// that Close finds it and stops what was opened.
+			f.st, f.stop = live, stop
+			err = ErrGroupClosed
+		default:
+			f.st, f.stop = live, stop
+			f.refs = 1
+			if g.Hooks.Joined != nil {
+				g.Hooks.Joined(key, 1)
+			}
+		}
+		f.wakeLocked()
+		g.mu.Unlock()
+	}()
+
+	stop, err = g.Source(key, f)
+	if g.Hooks.Opened != nil {
+		g.Hooks.Opened(key, err)
+	}
+	if err != nil {
+		return err // nothing to stop, even if the Source ended it before failing
+	}
+	// Set last, and not from err: a panicking Source leaves err nil, and
+	// publishing it live with no stop func would leak the upstream.
+	opened = true
+	return nil
 }
 
 // claimLocked moves f from live to stopping, disarming its linger timer.
