@@ -29,7 +29,10 @@ const (
 )
 
 // SubscribeOption configures a channel subscription.
-type SubscribeOption func(*subscribeConfig)
+//
+// It takes and returns a config by value rather than by pointer so the config
+// stays on the stack: passing its address to a func value would escape it.
+type SubscribeOption func(subscribeConfig) subscribeConfig
 
 type subscribeConfig struct {
 	buffer   int
@@ -39,13 +42,13 @@ type subscribeConfig struct {
 // WithBuffer sets how many values the channel queues. It is at least 1, which
 // is also the default.
 func WithBuffer(n int) SubscribeOption {
-	return func(c *subscribeConfig) { c.buffer = n }
+	return func(c subscribeConfig) subscribeConfig { c.buffer = n; return c }
 }
 
 // WithOverflow sets what a full queue does with an arriving value. The default
 // is DropOldest.
 func WithOverflow(o Overflow) SubscribeOption {
-	return func(c *subscribeConfig) { c.overflow = o }
+	return func(c subscribeConfig) subscribeConfig { c.overflow = o; return c }
 }
 
 // Subscription is one subscriber of a key.
@@ -61,7 +64,8 @@ type Subscription[T any] struct {
 	owner    owner[T]
 
 	// closing is closed as soon as Close starts, so a Block delivery waiting on
-	// this subscriber gives up before Close needs the key's lock.
+	// this subscriber gives up before Close needs the key's lock. Only a Block
+	// delivery waits, so it is nil for every other subscription.
 	closing chan struct{}
 	done    chan struct{}
 	err     error // written once, before done is closed
@@ -77,12 +81,16 @@ type owner[T any] interface {
 }
 
 func newSubscription[T any](fn func(T), ch chan T, overflow Overflow) *Subscription[T] {
+	var closing chan struct{}
+	if fn == nil && overflow == Block {
+		closing = make(chan struct{})
+	}
 	return &Subscription[T]{
 		C:        ch,
 		fn:       fn,
 		ch:       ch,
 		overflow: overflow,
-		closing:  make(chan struct{}),
+		closing:  closing,
 		done:     make(chan struct{}),
 	}
 }
@@ -114,7 +122,9 @@ func (s *Subscription[T]) Dropped() uint64 {
 // error of stop. Close is idempotent and returns the same error every time.
 func (s *Subscription[T]) Close() error {
 	s.closeOnce.Do(func() {
-		close(s.closing)
+		if s.closing != nil {
+			close(s.closing)
+		}
 		s.closeErr = s.owner.leave(s)
 	})
 	return s.closeErr

@@ -24,7 +24,8 @@ var (
 // Set Source, and optionally the other fields, before first use and do not
 // change them afterwards. A Group must not be copied after first use.
 type Group[K comparable, T any] struct {
-	// Source opens the upstream of a key. Required.
+	// Source opens the upstream of a key. Required: subscribing to a Group
+	// without one panics.
 	Source Source[K, T]
 
 	// Replay is how many of the latest values a key remembers and delivers to
@@ -39,7 +40,8 @@ type Group[K comparable, T any] struct {
 	// Initial, if set, is called for each subscriber that joins a key, after
 	// Replay and before any live value, to send it values no other subscriber
 	// receives, such as a snapshot of the current state for a stream of deltas.
-	// send is valid only during the call.
+	// send is valid only during the call: retaining it and calling it later
+	// panics.
 	//
 	// No value is emitted during the call, but a value emitted right after it
 	// may already be reflected in the snapshot, so deltas should be idempotent.
@@ -86,7 +88,7 @@ type Hooks[K comparable, T any] struct {
 func (g *Group[K, T]) Subscribe(key K, opts ...SubscribeOption) (*Subscription[T], error) {
 	c := subscribeConfig{buffer: 1}
 	for _, opt := range opts {
-		opt(&c)
+		c = opt(c)
 	}
 
 	s := newSubscription[T](nil, make(chan T, max(c.buffer, 1)), c.overflow)
@@ -127,6 +129,10 @@ func (g *Group[K, T]) Close() error {
 }
 
 func (g *Group[K, T]) subscribe(key K, s *Subscription[T]) error {
+	if g.Source == nil {
+		panic("streamflight: Group.Source is nil")
+	}
+
 	f, err := g.acquire(key)
 	if err != nil {
 		return err

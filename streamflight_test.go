@@ -574,6 +574,35 @@ func TestInitial(t *testing.T) {
 	})
 }
 
+func TestMisuse(t *testing.T) {
+	t.Run("subscribing without a Source panics", func(t *testing.T) {
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{}
+
+		x.PanicsWithValue("streamflight: Group.Source is nil", func() {
+			g.Subscribe("k")
+		})
+		x.PanicsWithValue("streamflight: Group.Source is nil", func() {
+			g.SubscribeFunc("k", func(int) {})
+		})
+	})
+	t.Run("retaining the send of Initial panics", func(t *testing.T) {
+		x := require.New(t)
+		var escaped func(int)
+		g := &streamflight.Group[string, int]{
+			Source:  newRecorder().Source,
+			Initial: func(_ string, send func(int)) { escaped = send },
+		}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		x.PanicsWithValue("streamflight: Group.Initial called send after returning", func() {
+			escaped(1)
+		})
+		x.NoError(s.Close())
+	})
+}
+
 func TestLinger(t *testing.T) {
 	t.Run("the upstream stops once it has lingered", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {

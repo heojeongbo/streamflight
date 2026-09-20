@@ -142,7 +142,18 @@ func (f *flight[K, T]) attach(s *Subscription[T]) {
 		f.push(s, f.ring[(f.head-f.count+i+len(f.ring))%len(f.ring)], DropOldest)
 	}
 	if f.g.Initial != nil {
-		f.g.Initial(f.key, func(v T) { f.push(s, v, DropOldest) })
+		// send borrows the key's lock, which is held only for this call. A
+		// retained send would otherwise deliver without it, racing the whole
+		// key and panicking on a queue that has since been closed.
+		var live atomic.Bool
+		live.Store(true)
+		f.g.Initial(f.key, func(v T) {
+			if !live.Load() {
+				panic("streamflight: Group.Initial called send after returning")
+			}
+			f.push(s, v, DropOldest)
+		})
+		live.Store(false)
 	}
 	f.subs = append(f.subs, s)
 }
