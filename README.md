@@ -192,6 +192,10 @@ $ docker buildx bake test
 
 CI runs that container on `linux/amd64` and `linux/arm64`.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 MIT
