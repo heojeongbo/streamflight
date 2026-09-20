@@ -807,6 +807,57 @@ func TestGroupClose(t *testing.T) {
 		g := &streamflight.Group[string, int]{Source: newRecorder().Source}
 		x.NoError(g.Close())
 	})
+	t.Run("closing waits for a stop already in progress", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		src, entered, release := gatedStops(r.Source)
+		g := &streamflight.Group[string, int]{Source: src}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		go s.Close()
+		x.Equal("k", <-entered) // parked inside the stop func
+
+		closed := make(chan error, 1)
+		go func() { closed <- g.Close() }()
+		time.Sleep(time.Millisecond) // let Close park on the stop in progress
+		select {
+		case <-closed:
+			x.Fail("Close returned while an upstream was still stopping")
+		default:
+		}
+
+		release()
+		x.NoError(<-closed)
+		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
+	t.Run("a second close waits for the first", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		src, entered, release := gatedStops(r.Source)
+		g := &streamflight.Group[string, int]{Source: src}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		defer s.Close()
+
+		first := make(chan error, 1)
+		go func() { first <- g.Close() }()
+		x.Equal("k", <-entered) // the first Close is inside the stop func
+
+		second := make(chan error, 1)
+		go func() { second <- g.Close() }()
+		time.Sleep(time.Millisecond)
+		select {
+		case <-second:
+			x.Fail("the second Close returned before every upstream was stopped")
+		default:
+		}
+
+		release()
+		x.NoError(<-first)
+		x.NoError(<-second)
+	})
 }
 
 // TestGroupIsolation pins that a delivery that stalls stalls only its own key.
@@ -872,6 +923,127 @@ func TestGroupIsolation(t *testing.T) {
 		// Closing the Group is one of the three things documented to release a
 		// Block delivery, so it must not be the thing the delivery blocks.
 		within(t, "Close", func() { x.NoError(g.Close()) })
+	})
+}
+
+// gatedStops wraps a Source so that the first stop of each key parks until the
+// returned release is called, with entered reporting that it got there.
+func gatedStops(inner streamflight.Source[string, int]) (src streamflight.Source[string, int], entered <-chan string, release func()) {
+	in := make(chan string, 8)
+	gate := make(chan struct{})
+	var once sync.Once
+	var gated sync.Map
+	return func(key string, e streamflight.Emitter[int]) (func() error, error) {
+		stop, err := inner(key, e)
+		if err != nil {
+			return nil, err
+		}
+		return func() error {
+			if _, dup := gated.LoadOrStore(key, true); !dup {
+				in <- key
+				<-gate
+			}
+			if stop == nil {
+				return nil
+			}
+			return stop()
+		}, nil
+	}, in, func() { once.Do(func() { close(gate) }) }
+}
+
+// TestConcurrentStop pins that a key being stopped is not a key being held by
+// the Group: the stop func runs with no Group lock held, so everything else
+// carries on, and whoever wants the key next waits for the stop rather than
+// racing it.
+func TestConcurrentStop(t *testing.T) {
+	t.Run("a Source may use the Group while it is being stopped", func(t *testing.T) {
+		// The fan-in shape a gateway reaches for: one key is built out of
+		// another, and releases it on the way out. Its stop waits for that
+		// goroutine, so the Group must not be locked while it runs.
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{}
+		g.Source = func(key string, e streamflight.Emitter[int]) (func() error, error) {
+			if key == "raw" {
+				return func() error { return nil }, nil
+			}
+			return streamflight.Run(func(ctx context.Context, _ string, e streamflight.Emitter[int]) error {
+				inner, err := g.SubscribeFunc("raw", func(v int) { e.Emit(v) })
+				if err != nil {
+					return err
+				}
+				defer inner.Close() // needs the Group, while stop waits for us
+				<-ctx.Done()
+				return nil
+			})(key, e)
+		}
+
+		s, err := g.SubscribeFunc("derived", func(int) {})
+		x.NoError(err)
+		time.Sleep(10 * time.Millisecond) // let the inner subscription establish
+
+		done := make(chan error, 1)
+		go func() { done <- s.Close() }()
+		select {
+		case err := <-done:
+			x.NoError(err)
+		case <-time.After(5 * time.Second):
+			x.Fail("Close hung: stopping one key blocked the Group a Source needed")
+		}
+		x.NoError(g.Close())
+	})
+	t.Run("a subscriber waits for the stop in progress and opens a fresh upstream", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		src, entered, release := gatedStops(r.Source)
+		g := &streamflight.Group[string, int]{Source: src}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		go s.Close()
+		x.Equal("k", <-entered) // parked inside the stop func
+
+		joined := make(chan *streamflight.Subscription[int], 1)
+		go func() {
+			s2, err := g.Subscribe("k")
+			x.NoError(err)
+			joined <- s2
+		}()
+		time.Sleep(time.Millisecond) // let it park on the stop in progress
+		x.Equal([]string{"open k"}, r.Log(), "the fresh upstream waits for the stop")
+
+		release()
+		s2 := <-joined
+		x.Equal([]string{"open k", "stop k", "open k"}, r.Log())
+		x.NoError(s2.Close())
+		x.Equal([]string{"open k", "stop k", "open k", "stop k"}, r.Log())
+	})
+	t.Run("concurrent subscribers of an ended upstream stop it once", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		old, err := g.Subscribe("k")
+		x.NoError(err)
+		r.emitter("k").End(nil)
+
+		const n = 16
+		subs := make([]*streamflight.Subscription[int], n)
+		var wg sync.WaitGroup
+		for i := range subs {
+			wg.Go(func() {
+				s, err := g.Subscribe("k")
+				x.NoError(err)
+				subs[i] = s
+			})
+		}
+		wg.Wait()
+
+		x.Equal([]string{"open k", "stop k", "open k"}, r.Log(), "stopped once, re-opened once")
+		x.NoError(old.Close())
+		for _, s := range subs {
+			x.NoError(s.Close())
+		}
+		x.Equal([]string{"open k", "stop k", "open k", "stop k"}, r.Log())
 	})
 }
 

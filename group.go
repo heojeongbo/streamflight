@@ -19,6 +19,28 @@ var (
 	ErrGroupClosed = errors.New("streamflight: group closed")
 )
 
+// state is where a flight is in its life.
+//
+// A flight occupies its key's slot in g.flights from the moment it starts
+// opening until its stop func has returned. That occupancy, rather than a lock
+// held across both, is what keeps a key from being re-opened before its
+// previous upstream has been stopped. Three invariants follow from it:
+//
+//   - g.flights[k] is non-nil exactly while that flight is opening, live or
+//     stopping. Whoever makes it dead deletes it.
+//   - g.mu is a leaf: nothing is waited on while it is held, and the only user
+//     code that runs under it is the Joined and Left hooks.
+//   - f.stop is called by exactly one goroutine, the one whose live to stopping
+//     claim succeeded.
+type state uint8
+
+const (
+	opening  state = iota // the Source is running; nobody may join or stop it
+	live                  // open succeeded: subscribers join and leave
+	stopping              // the stop func is running, owned by one goroutine
+	dead                  // terminal: the open failed, or the stop returned
+)
+
 // Group shares one upstream per key among its subscribers.
 //
 // Set Source, and optionally the other fields, before first use and do not
@@ -55,9 +77,9 @@ type Group[K comparable, T any] struct {
 	// Hooks observe the Group, for logging and metrics.
 	Hooks Hooks[K, T]
 
-	mu      sync.Mutex
-	flights map[K]*flight[K, T]
-	closed  bool
+	mu        sync.Mutex
+	flights   map[K]*flight[K, T]
+	closeDone chan struct{} // non-nil once a Close has started
 }
 
 // Hooks observe a Group. Every field is optional. None may call back into the
@@ -114,18 +136,43 @@ func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error)
 // funcs, joined. Close is idempotent.
 func (g *Group[K, T]) Close() error {
 	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if g.closed {
+	if g.closeDone != nil {
+		done := g.closeDone
+		g.mu.Unlock()
+		<-done // every upstream has been stopped once any Close returns
 		return nil
 	}
-	g.closed = true
+	done := make(chan struct{})
+	g.closeDone = done // from here Subscribe fails
+	g.mu.Unlock()
+	defer close(done)
 
 	var errs []error
-	for _, f := range g.flights {
-		errs = append(errs, g.stopLocked(f, ErrGroupClosed))
+	for {
+		g.mu.Lock()
+		var doomed []*flight[K, T]
+		var w chan struct{}
+		for _, f := range g.flights {
+			if g.beginStop(f) {
+				doomed = append(doomed, f)
+			} else if w == nil {
+				// Being opened or stopped elsewhere: wait for it rather than
+				// leave it running.
+				w = f.waitLocked()
+			}
+		}
+		g.mu.Unlock()
+
+		for _, f := range doomed {
+			errs = append(errs, g.doStop(f, ErrGroupClosed))
+		}
+		if len(doomed) == 0 {
+			if w == nil {
+				return errors.Join(errs...)
+			}
+			<-w
+		}
 	}
-	return errors.Join(errs...)
 }
 
 func (g *Group[K, T]) subscribe(key K, s *Subscription[T]) error {
@@ -143,99 +190,157 @@ func (g *Group[K, T]) subscribe(key K, s *Subscription[T]) error {
 }
 
 // acquire returns the upstream of key with one more reference, opening it if
-// key has none.
+// key has none and waiting if another goroutine is opening or stopping it.
 func (g *Group[K, T]) acquire(key K) (*flight[K, T], error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	for {
+		g.mu.Lock()
+		// Re-checked every time round, so a waiter woken by Close never parks
+		// again.
+		if g.closeDone != nil {
+			g.mu.Unlock()
+			return nil, ErrGroupClosed
+		}
 
-	if g.closed {
-		return nil, ErrGroupClosed
+		f := g.flights[key]
+		switch {
+		case f == nil:
+			f = newFlight(g, key)
+			stop, err := g.Source(key, f)
+			if g.Hooks.Opened != nil {
+				g.Hooks.Opened(key, err)
+			}
+			if err != nil {
+				// Nothing to stop, even if the Source ended it before failing,
+				// and nothing in the map to remove.
+				f.st = dead
+				g.mu.Unlock()
+				return nil, err
+			}
+			f.stop = stop
+			f.st = live
+			if g.flights == nil {
+				g.flights = make(map[K]*flight[K, T])
+			}
+			g.flights[key] = f
+			f.refs++
+			if g.Hooks.Joined != nil {
+				g.Hooks.Joined(key, f.refs)
+			}
+			g.mu.Unlock()
+			// Returned without re-reading the state: an upstream that ended
+			// while opening belongs to this subscriber, which attach ends.
+			return f, nil
+
+		case f.st != live:
+			// Another goroutine owns it. Wait for it to finish, then look
+			// again: the key may be free, or held by a fresh upstream.
+			w := f.waitLocked()
+			g.mu.Unlock()
+			<-w
+
+		case f.ended.Load():
+			// Stop an upstream that ended by itself before opening its
+			// successor, so open never overtakes stop for the same key. Inline
+			// on this goroutine, so the next pass opens straight afterwards.
+			g.claimLocked(f)
+			g.mu.Unlock()
+			_ = g.doStop(f, nil)
+
+		default:
+			if f.timer != nil {
+				// Back within Linger: keep it.
+				f.timer.Stop()
+				f.timer = nil
+				f.gen++
+			}
+			f.refs++
+			if g.Hooks.Joined != nil {
+				g.Hooks.Joined(key, f.refs)
+			}
+			g.mu.Unlock()
+			return f, nil
+		}
 	}
+}
 
-	f := g.flights[key]
-	if f != nil && f.ended.Load() {
-		// Stop an upstream that ended by itself before opening its successor,
-		// so open never overtakes stop for the same key.
-		g.stopLocked(f, nil)
-		f = nil
-	}
-
-	if f == nil {
-		f = newFlight(g, key)
-		stop, err := g.Source(key, f)
-		if g.Hooks.Opened != nil {
-			g.Hooks.Opened(key, err)
-		}
-		if err != nil {
-			// Nothing to stop, even if the Source ended it before failing.
-			f.stopped = true
-			return nil, err
-		}
-		f.stop = stop
-
-		if g.flights == nil {
-			g.flights = make(map[K]*flight[K, T])
-		}
-		g.flights[key] = f
-	} else if f.timer != nil {
-		// Back within Linger: keep it.
+// claimLocked moves f from live to stopping, disarming its linger timer.
+// g.mu must be held, and the caller must have seen f live under it.
+func (g *Group[K, T]) claimLocked(f *flight[K, T]) {
+	f.st = stopping
+	if f.timer != nil {
 		f.timer.Stop()
 		f.timer = nil
-		f.gen++
 	}
+}
 
-	f.refs++
-	if g.Hooks.Joined != nil {
-		g.Hooks.Joined(key, f.refs)
+// beginStop claims the right to stop f, if it is still live. g.mu must be
+// held. Exactly one caller ever gets true, which is what stops it once.
+func (g *Group[K, T]) beginStop(f *flight[K, T]) bool {
+	if f.st != live {
+		return false
 	}
-	return f, nil
+	g.claimLocked(f)
+	return true
 }
 
 // release drops one reference to f and, if it was the last, stops f now or
 // once it has lingered.
 func (g *Group[K, T]) release(f *flight[K, T]) error {
 	g.mu.Lock()
-	defer g.mu.Unlock()
-
 	f.refs--
 	if g.Hooks.Left != nil {
 		g.Hooks.Left(f.key, f.refs)
 	}
 	if f.refs > 0 {
+		g.mu.Unlock()
 		return nil
 	}
 
-	if g.Linger > 0 && !f.stopped && !f.ended.Load() {
+	if g.Linger > 0 && f.st == live && !f.ended.Load() {
 		f.gen++
 		gen := f.gen
 		f.timer = time.AfterFunc(g.Linger, func() { g.expire(f, gen) })
+		g.mu.Unlock()
 		return nil
 	}
-	return g.stopLocked(f, nil)
+	claimed := g.beginStop(f)
+	g.mu.Unlock()
+
+	if !claimed {
+		return nil // already being stopped, by a Close, a takeover or the timer
+	}
+	// On this goroutine, so Close reports the stop error to its caller.
+	return g.doStop(f, nil)
 }
 
 // expire stops f once it has lingered, unless a subscriber came back since.
 func (g *Group[K, T]) expire(f *flight[K, T], gen uint64) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	// Two guards for two windows: gen covers a subscriber that came back before
+	// this timer reached the lock, beginStop a Close or a takeover that claimed
+	// the flight in the same window.
+	claimed := f.gen == gen && g.beginStop(f)
+	g.mu.Unlock()
 
-	if f.gen == gen {
-		g.stopLocked(f, nil)
+	if claimed {
+		_ = g.doStop(f, nil)
 	}
 }
 
-// stopLocked stops f once, ending what is still subscribed to it with reason.
-// g.mu must be held.
-func (g *Group[K, T]) stopLocked(f *flight[K, T], reason error) error {
-	if f.stopped {
-		return nil
-	}
-	f.stopped = true
-	delete(g.flights, f.key)
-	if f.timer != nil {
-		f.timer.Stop()
-		f.timer = nil
-	}
+// doStop stops f, ending what is still subscribed to it with reason, and then
+// releases its key. It holds no lock while the stop func runs, and is reached
+// only through a claim, so it runs exactly once per flight.
+func (g *Group[K, T]) doStop(f *flight[K, T], reason error) error {
+	defer func() {
+		// Last, so that whoever takes the key next sees the whole stop, hooks
+		// included, before it opens. Deferred so a panicking stop func frees
+		// the key rather than wedging it.
+		g.mu.Lock()
+		delete(g.flights, f.key)
+		f.st = dead
+		f.wakeLocked()
+		g.mu.Unlock()
+	}()
 
 	f.unblock()
 	f.mu.Lock()

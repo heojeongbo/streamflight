@@ -21,10 +21,11 @@ type flight[K comparable, T any] struct {
 	quitOnce sync.Once
 
 	// Guarded by g.mu.
-	refs    int
-	gen     uint64 // bumped whenever a linger timer is armed or disarmed
-	timer   *time.Timer
-	stopped bool
+	refs  int
+	gen   uint64 // bumped whenever a linger timer is armed or disarmed
+	timer *time.Timer
+	st    state
+	wait  chan struct{} // closed when f leaves the phase it is in
 
 	// ended mirrors done so the Group can tell whether this flight has ended
 	// without waiting for a delivery that is holding mu. Written under mu.
@@ -105,6 +106,25 @@ func (f *flight[K, T]) End(err error) {
 // unblock lets an Emit waiting on a Block subscriber go.
 func (f *flight[K, T]) unblock() {
 	f.quitOnce.Do(func() { close(f.quit) })
+}
+
+// waitLocked returns a channel closed when f leaves the phase it is in. The
+// caller must have observed that phase in the same critical section, so the
+// channel it gets is the one the phase's own exit closes. g.mu must be held.
+func (f *flight[K, T]) waitLocked() chan struct{} {
+	if f.wait == nil {
+		f.wait = make(chan struct{})
+	}
+	return f.wait
+}
+
+// wakeLocked releases everyone waiting on the phase f is leaving. g.mu must be
+// held.
+func (f *flight[K, T]) wakeLocked() {
+	if f.wait != nil {
+		close(f.wait)
+		f.wait = nil
+	}
 }
 
 // finish ends every subscriber with err and drops what is kept for Replay.
