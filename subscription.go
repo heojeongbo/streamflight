@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Overflow is what a channel subscriber's queue does with a value that arrives
@@ -81,6 +82,7 @@ type Subscription[T any] struct {
 
 type owner[T any] interface {
 	leave(s *Subscription[T]) error
+	latest() (T, time.Time, bool)
 }
 
 func newSubscription[T any](fn func(T), ch chan T, overflow Overflow) *Subscription[T] {
@@ -120,6 +122,24 @@ func (s *Subscription[T]) Dropped() uint64 {
 	return s.dropped.Load()
 }
 
+// Latest returns the newest value of the key, when it arrived, and whether
+// there is one yet. It is valid only on a subscription from
+// [Group.SubscribeLatest], and reads without waiting for a delivery, so a
+// subscriber that has fallen behind never holds a sampler up.
+//
+// There is nothing until the first value emitted after the first sampler of
+// the key joined, the same as any latch: a key remembers its newest value only
+// once somebody is watching for it. Whether a value is still current is the
+// caller's to decide from at, because the answer depends on the key — silence
+// on a topic published only when it changes means nothing changed, and on a
+// sensor means the sensor is gone.
+func (s *Subscription[T]) Latest() (v T, at time.Time, ok bool) {
+	if s.fn != nil || s.ch != nil {
+		panic("streamflight: Latest on a subscription that is delivered to")
+	}
+	return s.owner.latest()
+}
+
 // Drain sends every value of the subscription with send, until ctx is done or
 // the subscription ends. It is the body of a handler that relays one key to one
 // client.
@@ -140,11 +160,11 @@ func (s *Subscription[T]) Dropped() uint64 {
 // two-line closure where it does not.
 //
 // Drain does not close the subscription. The caller still owns it, and may
-// Drain it again. It panics on a subscription from [Group.SubscribeFunc], which
-// has no channel to drain.
+// Drain it again. It panics on a subscription that has no channel to drain,
+// which is any made by [Group.SubscribeFunc] or [Group.SubscribeLatest].
 func (s *Subscription[T]) Drain(ctx context.Context, send func(T) error) error {
 	if s.ch == nil {
-		panic("streamflight: Drain on a SubscribeFunc subscription")
+		panic("streamflight: Drain on a subscription with no channel")
 	}
 	for {
 		select {

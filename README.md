@@ -128,10 +128,17 @@ falling behind costs. That is why a network write belongs here and not in
 
 ## Choosing the behaviour
 
-**Delivery.** `SubscribeFunc` calls the function on the goroutine that emitted
-the value: nothing is queued, but a slow function holds up every other
-subscriber of the key. `Subscribe` queues on a channel instead, and its
-`Overflow` policy decides what happens to a subscriber that falls behind:
+**Delivery.** Three shapes, for three kinds of consumer:
+
+| | | For |
+|---|---|---|
+| `SubscribeFunc` | calls a function on the emitting goroutine | every value matters and the work is short |
+| `Subscribe` | queues on a channel | every value matters and the work can block |
+| `SubscribeLatest` | keeps only the newest, read with `Latest()` | only the current value matters |
+
+`SubscribeFunc` queues nothing, but a slow function holds up every other
+subscriber of the key. `Subscribe` queues instead, and its `Overflow` policy
+decides what happens to a subscriber that falls behind:
 
 | Policy | A full queue… | For |
 |---|---|---|
@@ -205,6 +212,15 @@ shared one decodes it once.
 
 A channel costs most when its reader is parked: each send wakes a goroutine.
 Prefer `SubscribeFunc` for high fan-out on a hot path.
+
+**Sampling**, where the key keeps one value however many subscribers read it.
+`Latest()` itself is 5.1 ns and allocates nothing.
+
+| Subscribers | `Subscribe`, read by a goroutine | `SubscribeLatest` | |
+|---:|---:|---:|---:|
+| 1 | 37 ns | 39 ns | 1× |
+| 10 | 463 ns | 47 ns | 10× |
+| 100 | 14.7 µs | 182 ns | 80× |
 
 **Independence.** Opening keys that share nothing, with a `Source` that takes
 1 ms — roughly what subscribing to a broker costs. The total is one delay, not

@@ -150,6 +150,26 @@ func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error)
 	return s, nil
 }
 
+// SubscribeLatest joins key and keeps only its newest value, for a subscriber
+// that samples on its own clock rather than being delivered to. Nothing is
+// queued and nothing is called: each value replaces the one before it, and
+// [Subscription.Latest] reads whatever is there when it is asked.
+//
+// Use it for state, where a reader wants the current answer whenever it looks:
+// a handler on its own interval, a frame loop, a health check. A channel
+// cannot do this, because receiving consumes — a reader that looks while the
+// upstream is quiet finds an empty queue, not the value that is still true.
+//
+// It costs the key one stored value however many subscribers sample it, and
+// costs a subscriber nothing per value. A key nobody samples stores nothing.
+func (g *Group[K, T]) SubscribeLatest(key K) (*Subscription[T], error) {
+	s := newSubscription[T](nil, nil, 0)
+	if err := g.subscribe(key, s); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
 // Close stops every upstream, ends every subscription with ErrGroupClosed and
 // makes later Subscribe calls fail with it. It returns the errors of the stop
 // funcs, joined. Close is idempotent.

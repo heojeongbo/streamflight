@@ -77,6 +77,42 @@ func BenchmarkEmit(b *testing.B) {
 	}
 }
 
+// BenchmarkEmitLatest is one value reaching n subscribers that sample instead
+// of being delivered to. The key stores it once however many are watching, so
+// this should be flat in n.
+func BenchmarkEmitLatest(b *testing.B) {
+	for _, n := range fanouts {
+		b.Run(fmt.Sprintf("subscribers=%d", n), func(b *testing.B) {
+			e := openKey(b, n, func(g *streamflight.Group[string, int]) *streamflight.Subscription[int] {
+				return must(g.SubscribeLatest("k"))
+			})
+			b.ReportAllocs()
+			for b.Loop() {
+				e.Emit(1)
+			}
+		})
+	}
+}
+
+// BenchmarkLatest is a sampler reading the current value.
+func BenchmarkLatest(b *testing.B) {
+	var e streamflight.Emitter[int]
+	g := &streamflight.Group[string, int]{
+		Source: func(_ string, e_ streamflight.Emitter[int]) (func() error, error) {
+			e = e_
+			return nil, nil
+		},
+	}
+	s := must(g.SubscribeLatest("k"))
+	defer s.Close()
+	e.Emit(1)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		s.Latest()
+	}
+}
+
 // BenchmarkEmitParallel is one key emitted to from every P at once.
 func BenchmarkEmitParallel(b *testing.B) {
 	e := openKey(b, 10, func(g *streamflight.Group[string, int]) *streamflight.Subscription[int] {

@@ -35,6 +35,20 @@ type flight[K comparable, T any] struct {
 	// without waiting for a delivery that is holding mu. Written under mu.
 	ended atomic.Bool
 
+	// The newest value, for the subscribers that sample instead of being
+	// delivered to. One per key rather than one per subscriber: they all want
+	// the same answer, so Emit stores it once however many are watching.
+	//
+	// latestMu is a leaf, taken only around these three fields and never while
+	// mu is wanted, so a reader is never behind a delivery. wanted is set by
+	// the first such subscriber and guards the cost of the clock read for
+	// every key that has none.
+	latestMu sync.RWMutex
+	latestV  T
+	latestAt time.Time
+	latestOK bool
+	wanted   bool // guarded by mu
+
 	// mu guards the fields below and is held for every delivery.
 	mu     sync.Mutex
 	subs   []*Subscription[T]
@@ -85,6 +99,12 @@ func (f *flight[K, T]) Emit(v T) int {
 		f.ring[f.head] = v
 		f.head = (f.head + 1) % len(f.ring)
 		f.count = min(f.count+1, len(f.ring))
+	}
+
+	if f.wanted {
+		f.latestMu.Lock()
+		f.latestV, f.latestAt, f.latestOK = v, time.Now(), true
+		f.latestMu.Unlock()
 	}
 
 	n := 0
@@ -169,6 +189,13 @@ func (f *flight[K, T]) attach(s *Subscription[T]) {
 		return
 	}
 
+	if s.fn == nil && s.ch == nil {
+		// From here the key keeps its newest value. Not unset when this
+		// subscriber leaves: the next one would otherwise find nothing where
+		// the one before it was reading.
+		f.wanted = true
+	}
+
 	// Never wait on a subscriber that cannot read yet: it is still inside
 	// Subscribe. A queue shorter than what is sent keeps the newest.
 	for i := range f.count {
@@ -202,10 +229,23 @@ func (f *flight[K, T]) leave(s *Subscription[T]) error {
 	return f.g.release(f)
 }
 
+// latest is the newest value of this key, when it arrived, and whether there
+// is one. It takes no lock a delivery can hold.
+func (f *flight[K, T]) latest() (T, time.Time, bool) {
+	f.latestMu.RLock()
+	defer f.latestMu.RUnlock()
+	return f.latestV, f.latestAt, f.latestOK
+}
+
 // push delivers v to s under the given policy. f.mu must be held.
 func (f *flight[K, T]) push(s *Subscription[T], v T, policy Overflow) outcome {
 	if s.fn != nil {
 		s.fn(v)
+		return accepted
+	}
+	if s.ch == nil {
+		// A sampling subscriber. Emit already stored the value for the whole
+		// key, so there is nothing to hand this one.
 		return accepted
 	}
 

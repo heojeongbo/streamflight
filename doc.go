@@ -29,6 +29,13 @@
 // values ([DropOldest], the default), keep the oldest ([DropNewest]), wait for
 // it ([Block]), or cut it off ([Evict]).
 //
+// [Group.SubscribeLatest] does not deliver at all. The key keeps its newest
+// value and [Subscription.Latest] reads it, as often as the reader likes, for a
+// subscriber on its own clock that wants the current answer whenever it looks.
+// A channel cannot do that, because receiving consumes: a reader that looks
+// while the upstream is quiet finds an empty queue rather than the value that
+// is still true. The key stores it once however many subscribers sample it.
+//
 // [Subscription.Drain] is that channel pumped into a sink until a context ends,
 // which is what a handler relaying one key to one client does. A write that can
 // block belongs there rather than in SubscribeFunc, where it would hold up

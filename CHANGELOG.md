@@ -8,6 +8,33 @@ four new names.
 
 ### Added
 
+- **`Group.SubscribeLatest(key)` and `Subscription.Latest()`** — a third
+  delivery shape, for a subscriber on its own clock that wants the current
+  value whenever it looks rather than every value as it arrives. Nothing is
+  queued and nothing is called: the key keeps its newest value and the
+  subscriber samples it.
+
+  A channel cannot do this, because receiving consumes — a reader that looks
+  while the upstream is quiet finds an empty queue rather than the value that
+  is still true. `Replay: 1` was already the push half of the same idea; this
+  is the pull half.
+
+  The key stores one value however many subscribers sample it, so the cost does
+  not grow with them, and `Latest` never waits for a delivery:
+
+  | Subscribers | `Subscribe`, read by a goroutine | `SubscribeLatest` |
+  |---:|---:|---:|
+  | 1 | 37 ns | 39 ns |
+  | 10 | 463 ns | 47 ns |
+  | 100 | 14.7 µs | 182 ns |
+
+  A key nobody samples is unaffected: `Emit` stays at 5.4 ns and allocates
+  nothing. There is no value until the first one emitted after the first
+  sampler joined, and whether a value is still current is the caller's to
+  decide from the arrival time `Latest` returns — silence on a topic published
+  only when it changes means nothing changed, and on a sensor means the sensor
+  is gone.
+
 - **`Subscription.Drain(ctx, send)`** — the body of a handler relaying one key
   to one client: the select on the context and the channel, the closed-channel
   case, the send error. `send` is a `func(T) error`, so it is whatever the

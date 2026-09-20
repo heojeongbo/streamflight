@@ -417,7 +417,146 @@ func TestDrain(t *testing.T) {
 		x.NoError(err)
 		defer s.Close()
 
-		x.PanicsWithValue("streamflight: Drain on a SubscribeFunc subscription", func() {
+		x.PanicsWithValue("streamflight: Drain on a subscription with no channel", func() {
+			s.Drain(context.Background(), func(int) error { return nil })
+		})
+	})
+}
+
+func TestSubscribeLatest(t *testing.T) {
+	t.Run("a sampler reads the newest value as often as it likes", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		defer s.Close()
+		x.Nil(s.C, "nothing is queued")
+
+		_, _, ok := s.Latest()
+		x.False(ok, "nothing has been emitted yet")
+
+		r.emit("k", 1, 2, 3)
+		for range 3 {
+			// The read is not destructive, which is the whole point: a channel
+			// would have answered once and then run dry.
+			v, at, ok := s.Latest()
+			x.True(ok)
+			x.Equal(3, v)
+			x.False(at.IsZero())
+		}
+	})
+	t.Run("every sampler of a key shares one stored value", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		a, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		b, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		x.Equal([]string{"open k"}, r.Log(), "one upstream, as ever")
+
+		x.Equal(2, r.emit("k", 7), "both count as having taken it")
+		av, aat, _ := a.Latest()
+		bv, bat, _ := b.Latest()
+		x.Equal(7, av)
+		x.Equal(av, bv)
+		x.Equal(aat, bat, "the same stored value, not a copy each")
+
+		x.NoError(a.Close())
+		x.Equal([]string{"open k"}, r.Log(), "b still holds it")
+		x.NoError(b.Close())
+		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
+	t.Run("a sampler joining later reads what is already there", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		first, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		defer first.Close()
+		r.emit("k", 5)
+
+		late, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		defer late.Close()
+		v, _, ok := late.Latest()
+		x.True(ok)
+		x.Equal(5, v, "the key was already keeping it")
+	})
+	t.Run("a sampler does not hold up the values a channel gets", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		sampler, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		defer sampler.Close()
+		ch, err := g.Subscribe("k", streamflight.WithBuffer(4))
+		x.NoError(err)
+		defer ch.Close()
+
+		r.emit("k", 1, 2)
+		x.Equal([]int{1, 2}, drain(ch.C), "the queue is unaffected")
+		v, _, _ := sampler.Latest()
+		x.Equal(2, v)
+	})
+	t.Run("it ends like any other subscription", func(t *testing.T) {
+		x := require.New(t)
+		boom := errors.New("boom")
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		r.emit("k", 1)
+		r.emitter("k").End(boom)
+
+		<-s.Done()
+		x.ErrorIs(s.Err(), boom)
+		v, _, ok := s.Latest()
+		x.True(ok)
+		x.Equal(1, v, "the last value it saw is still readable")
+		x.NoError(s.Close())
+	})
+	t.Run("Latest is only for a subscription that is not delivered to", func(t *testing.T) {
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{Source: newRecorder().Source}
+
+		ch, err := g.Subscribe("k")
+		x.NoError(err)
+		defer ch.Close()
+		fn, err := g.SubscribeFunc("k", func(int) {})
+		x.NoError(err)
+		defer fn.Close()
+
+		const msg = "streamflight: Latest on a subscription that is delivered to"
+		x.PanicsWithValue(msg, func() { ch.Latest() })
+		x.PanicsWithValue(msg, func() { fn.Latest() })
+	})
+	t.Run("an open error is returned, as for any subscribe", func(t *testing.T) {
+		x := require.New(t)
+		boom := errors.New("boom")
+		r := newRecorder()
+		r.openErr = boom
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.SubscribeLatest("k")
+		x.ErrorIs(err, boom)
+		x.Nil(s)
+	})
+	t.Run("a sampler has no channel to drain", func(t *testing.T) {
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{Source: newRecorder().Source}
+
+		s, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		defer s.Close()
+
+		x.PanicsWithValue("streamflight: Drain on a subscription with no channel", func() {
 			s.Drain(context.Background(), func(int) error { return nil })
 		})
 	})
