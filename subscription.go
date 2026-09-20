@@ -133,8 +133,12 @@ func (s *Subscription[T]) Close() error {
 // end finishes the subscription. Called once, under the key's lock.
 func (s *Subscription[T]) end(err error) {
 	s.err = err
+	// Before the queue. A reader that ranges over C asks Err why it ended as
+	// soon as C closes, and closing done second would let it find no reason at
+	// all. A reader selecting on both sees the end while values are still
+	// queued instead, and C goes on yielding them.
+	close(s.done)
 	if s.ch != nil {
 		close(s.ch)
 	}
-	close(s.done)
 }

@@ -302,6 +302,30 @@ func TestSubscription(t *testing.T) {
 		x.Equal(8, cap(s.C))
 		x.NoError(s.Close())
 	})
+	t.Run("why it ended is visible as soon as the channel closes", func(t *testing.T) {
+		// The documented idiom is to range over C and then ask Err why it
+		// ended, so the reason has to be readable the moment C closes.
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.Subscribe("k", streamflight.WithBuffer(4))
+		x.NoError(err)
+		r.emit("k", 1, 2)
+
+		var got error
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			for range s.C {
+			}
+			got = s.Err()
+		})
+		r.emitter("k").End(io.EOF)
+		wg.Wait()
+
+		x.ErrorIs(got, io.EOF, "the reason was lost to a reader woken by the close")
+		x.NoError(s.Close())
+	})
 	t.Run("what was queued is still read after close", func(t *testing.T) {
 		x := require.New(t)
 		r := newRecorder()
