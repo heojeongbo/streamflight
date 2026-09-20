@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"fmt"
 	"hash/crc32"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/heojeongbo/streamflight"
 )
@@ -121,6 +124,128 @@ func BenchmarkOpenStop(b *testing.B) {
 	for b.Loop() {
 		must(g.SubscribeFunc("k", func(int) {})).Close()
 	}
+}
+
+// BenchmarkOpenStopParallel is many goroutines each opening and stopping a key
+// of its own. Distinct keys share nothing, so this should scale with P.
+func BenchmarkOpenStopParallel(b *testing.B) {
+	g := &streamflight.Group[int, int]{
+		Source: func(int, streamflight.Emitter[int]) (func() error, error) {
+			return func() error { return nil }, nil
+		},
+	}
+	var key atomic.Int64
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		k := int(key.Add(1))
+		for pb.Next() {
+			must(g.SubscribeFunc(k, func(int) {})).Close()
+		}
+	})
+}
+
+// BenchmarkSlowSource is what an upstream that costs something to open does to
+// the rest of the Group. Each goroutine opens a key of its own, so a Group that
+// keeps keys independent finishes in about one delay regardless of how many
+// goroutines there are.
+func BenchmarkSlowSource(b *testing.B) {
+	const delay = time.Millisecond
+	for _, n := range []int{1, 8, 32} {
+		b.Run(fmt.Sprintf("keys=%d", n), func(b *testing.B) {
+			g := &streamflight.Group[int, int]{
+				Source: func(int, streamflight.Emitter[int]) (func() error, error) {
+					time.Sleep(delay)
+					return func() error { return nil }, nil
+				},
+			}
+			for b.Loop() {
+				var wg sync.WaitGroup
+				for k := range n {
+					wg.Go(func() { must(g.SubscribeFunc(k, func(int) {})).Close() })
+				}
+				wg.Wait()
+			}
+		})
+	}
+}
+
+// BenchmarkJoin is what a subscriber costs to join a key that is already open,
+// for each way of catching it up.
+func BenchmarkJoin(b *testing.B) {
+	join := func(b *testing.B, g *streamflight.Group[string, int], emitted int) {
+		b.Helper()
+		var e streamflight.Emitter[int]
+		g.Source = func(_ string, e_ streamflight.Emitter[int]) (func() error, error) {
+			e = e_
+			return nil, nil
+		}
+		keep := must(g.SubscribeFunc("k", func(int) {}))
+		defer keep.Close()
+		for i := range emitted {
+			e.Emit(i) // what a joiner will be caught up on
+		}
+		b.ReportAllocs()
+		for b.Loop() {
+			must(g.Subscribe("k", streamflight.WithBuffer(8))).Close()
+		}
+	}
+	b.Run("plain", func(b *testing.B) {
+		join(b, &streamflight.Group[string, int]{}, 0)
+	})
+	b.Run("replay=8", func(b *testing.B) {
+		join(b, &streamflight.Group[string, int]{Replay: 8}, 8)
+	})
+	b.Run("initial", func(b *testing.B) {
+		join(b, &streamflight.Group[string, int]{
+			Initial: func(_ string, send func(int)) { send(1) },
+		}, 0)
+	})
+}
+
+// BenchmarkOverflow is one value reaching a queue that is already full, under
+// each policy that keeps the subscriber. Evict is not here: it closes the
+// subscriber, so it happens once rather than per value, and Block cannot fill
+// up at all while its subscriber reads.
+func BenchmarkOverflow(b *testing.B) {
+	for _, p := range []struct {
+		name string
+		o    streamflight.Overflow
+	}{
+		{"DropOldest", streamflight.DropOldest},
+		{"DropNewest", streamflight.DropNewest},
+	} {
+		b.Run(p.name, func(b *testing.B) {
+			var e streamflight.Emitter[int]
+			g := &streamflight.Group[string, int]{
+				Source: func(_ string, e_ streamflight.Emitter[int]) (func() error, error) {
+					e = e_
+					return nil, nil
+				},
+			}
+			s := must(g.Subscribe("k", streamflight.WithOverflow(p.o)))
+			defer s.Close()
+			e.Emit(0) // fill the one-slot queue
+			b.ReportAllocs()
+			for b.Loop() {
+				e.Emit(1)
+			}
+		})
+	}
+}
+
+// BenchmarkLinger is churn on one key: a subscriber leaves and comes back
+// before the upstream has finished lingering, so it is reused, not re-opened.
+func BenchmarkLinger(b *testing.B) {
+	g := &streamflight.Group[string, int]{Source: noopSource, Linger: time.Hour}
+	defer g.Close()
+	b.ReportAllocs()
+	for b.Loop() {
+		must(g.SubscribeFunc("k", func(int) {})).Close()
+	}
+}
+
+func noopSource(string, streamflight.Emitter[int]) (func() error, error) {
+	return nil, nil
 }
 
 // BenchmarkSharedVsDedicated is what sharing saves when every message costs
