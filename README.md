@@ -180,12 +180,17 @@ one per key.
 ## Development
 
 ```sh
-# Vet, race-test, and fail below 100% coverage.
+# Check formatting, vet, race-test five times, and fail below 100% coverage.
 $ ./scripts/test.sh
+
+# Race-test more, when chasing something intermittent.
+$ STREAMFLIGHT_TEST_COUNT=50 ./scripts/test.sh
 
 # The same, in the container CI uses.
 $ docker buildx bake test
 ```
+
+CI runs that container on `linux/amd64` and `linux/arm64`.
 
 ## License
 

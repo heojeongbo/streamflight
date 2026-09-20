@@ -24,7 +24,14 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both architectures, on native runners: a concurrency library is worth
+        # testing on more than one, and emulating the second would be far
+        # slower than running it for real.
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
       - uses: docker/setup-buildx-action@v4
@@ -34,7 +41,8 @@ jobs:
         with:
           source: .
           targets: test
+          # No platform is set, so each runner builds for its own. The cache is
+          # scoped per runner so the two do not overwrite each other's.
           set: |
-            *.platform=linux/amd64
-            *.cache-from=type=gha
-            *.cache-to=type=gha,mode=max
+            *.cache-from=type=gha,scope=${{ matrix.runner }}
+            *.cache-to=type=gha,mode=max,scope=${{ matrix.runner }}
