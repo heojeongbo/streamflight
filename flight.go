@@ -47,7 +47,8 @@ type flight[K comparable, T any] struct {
 	latestV  T
 	latestAt time.Time
 	latestOK bool
-	wanted   bool // guarded by mu
+	latestCh chan struct{} // closed and replaced whenever the value advances
+	wanted   bool          // guarded by mu
 
 	// mu guards the fields below and is held for every delivery.
 	mu     sync.Mutex
@@ -103,7 +104,20 @@ func (f *flight[K, T]) Emit(v T) int {
 
 	if f.wanted {
 		f.latestMu.Lock()
-		f.latestV, f.latestAt, f.latestOK = v, time.Now(), true
+		// Strictly after the one before it, even when the clock did not move
+		// between them: two values a caller can tell apart must have arrival
+		// times it can tell apart, or waiting for one past the other never
+		// ends. The nudge is a nanosecond and only under a clock too coarse to
+		// separate two emissions.
+		at := time.Now()
+		if f.latestOK && !at.After(f.latestAt) {
+			at = f.latestAt.Add(time.Nanosecond)
+		}
+		f.latestV, f.latestAt, f.latestOK = v, at, true
+		if f.latestCh != nil {
+			close(f.latestCh)
+			f.latestCh = nil
+		}
 		f.latestMu.Unlock()
 	}
 
@@ -235,6 +249,23 @@ func (f *flight[K, T]) latest() (T, time.Time, bool) {
 	f.latestMu.RLock()
 	defer f.latestMu.RUnlock()
 	return f.latestV, f.latestAt, f.latestOK
+}
+
+// latestAfter returns the newest value if it arrived after t, and otherwise a
+// channel closed when a newer one does. Both under one lock, so a value that
+// lands between looking and waiting wakes the waiter rather than being missed.
+func (f *flight[K, T]) latestAfter(t time.Time) (T, time.Time, bool, <-chan struct{}) {
+	f.latestMu.Lock()
+	defer f.latestMu.Unlock()
+
+	if f.latestOK && f.latestAt.After(t) {
+		return f.latestV, f.latestAt, true, nil
+	}
+	if f.latestCh == nil {
+		f.latestCh = make(chan struct{})
+	}
+	var zero T
+	return zero, time.Time{}, false, f.latestCh
 }
 
 // push delivers v to s under the given policy. f.mu must be held.

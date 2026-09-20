@@ -136,6 +136,16 @@ falling behind costs. That is why a network write belongs here and not in
 | `Subscribe` | queues on a channel | every value matters and the work can block |
 | `SubscribeLatest` | keeps only the newest, read with `Latest()` | only the current value matters |
 
+`SubscribeLatest` also has `Wait`, for reading back what you just wrote:
+
+```go
+sub, err := g.SubscribeLatest(robot)
+...
+at := time.Now()
+setMode(robot, mode)                       // the write
+v, _, ok := sub.Wait(ctx, at)              // not the value the write has not reached yet
+```
+
 `SubscribeFunc` queues nothing, but a slow function holds up every other
 subscriber of the key. `Subscribe` queues instead, and its `Overflow` policy
 decides what happens to a subscriber that falls behind:

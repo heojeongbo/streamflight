@@ -537,6 +537,71 @@ func TestSubscribeLatest(t *testing.T) {
 		x.PanicsWithValue(msg, func() { ch.Latest() })
 		x.PanicsWithValue(msg, func() { fn.Latest() })
 	})
+	t.Run("Wait blocks until a value newer than the one already there", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			g := &streamflight.Group[string, int]{Source: r.Source}
+
+			s, err := g.SubscribeLatest("k")
+			x.NoError(err)
+			defer s.Close()
+
+			r.emit("k", 1)
+			_, at, ok := s.Latest()
+			x.True(ok)
+
+			// Reading back after a write: the value that is there is the one
+			// the write has not reached yet, so waiting past it is the point.
+			got := make(chan int, 1)
+			go func() {
+				v, _, ok := s.Wait(t.Context(), at)
+				x.True(ok)
+				got <- v
+			}()
+			synctest.Wait()
+			x.Empty(got, "still the old value")
+
+			r.emit("k", 2)
+			x.Equal(2, <-got)
+		})
+	})
+	t.Run("Wait gives up with its context and with the subscription", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			g := &streamflight.Group[string, int]{Source: r.Source}
+
+			s, err := g.SubscribeLatest("k")
+			x.NoError(err)
+			defer s.Close()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan bool, 1)
+			go func() { _, _, ok := s.Wait(ctx, time.Time{}); done <- ok }()
+			synctest.Wait()
+			cancel()
+			x.False(<-done, "the caller gave up")
+
+			ended := make(chan bool, 1)
+			go func() { _, _, ok := s.Wait(t.Context(), time.Time{}); ended <- ok }()
+			synctest.Wait()
+			r.emitter("k").End(nil)
+			x.False(<-ended, "the upstream ended")
+		})
+	})
+	t.Run("Wait is only for a subscription that is not delivered to", func(t *testing.T) {
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{Source: newRecorder().Source}
+
+		ch, err := g.Subscribe("k")
+		x.NoError(err)
+		defer ch.Close()
+
+		x.PanicsWithValue("streamflight: Wait on a subscription that is delivered to", func() {
+			ch.Wait(context.Background(), time.Time{})
+		})
+	})
 	t.Run("an open error is returned, as for any subscribe", func(t *testing.T) {
 		x := require.New(t)
 		boom := errors.New("boom")

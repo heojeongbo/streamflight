@@ -34,7 +34,9 @@
 // subscriber on its own clock that wants the current answer whenever it looks.
 // A channel cannot do that, because receiving consumes: a reader that looks
 // while the upstream is quiet finds an empty queue rather than the value that
-// is still true. The key stores it once however many subscribers sample it.
+// is still true. The key stores it once however many subscribers sample it,
+// and [Subscription.Wait] blocks for one newer than a given time, which is how
+// a caller reads back what it has just written.
 //
 // [Subscription.Drain] is that channel pumped into a sink until a context ends,
 // which is what a handler relaying one key to one client does. A write that can

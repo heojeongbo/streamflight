@@ -83,6 +83,7 @@ type Subscription[T any] struct {
 type owner[T any] interface {
 	leave(s *Subscription[T]) error
 	latest() (T, time.Time, bool)
+	latestAfter(t time.Time) (T, time.Time, bool, <-chan struct{})
 }
 
 func newSubscription[T any](fn func(T), ch chan T, overflow Overflow) *Subscription[T] {
@@ -138,6 +139,35 @@ func (s *Subscription[T]) Latest() (v T, at time.Time, ok bool) {
 		panic("streamflight: Latest on a subscription that is delivered to")
 	}
 	return s.owner.latest()
+}
+
+// Wait blocks until the key has a value that arrived after t, and returns it.
+// ok is false if ctx ends first or the subscription does.
+//
+// It is for reading back what you just wrote, where the value you want is not
+// the one that is there: issue the write, note the time, and wait for a value
+// newer than that rather than sampling the one the write has not reached yet.
+// Pass a zero time to wait for the first value of all.
+//
+// Like [Subscription.Latest] it is valid only on a subscription from
+// [Group.SubscribeLatest], and waits on nothing a delivery can hold.
+func (s *Subscription[T]) Wait(ctx context.Context, t time.Time) (v T, at time.Time, ok bool) {
+	if s.fn != nil || s.ch != nil {
+		panic("streamflight: Wait on a subscription that is delivered to")
+	}
+	for {
+		v, at, ok, newer := s.owner.latestAfter(t)
+		if ok {
+			return v, at, true
+		}
+		select {
+		case <-newer:
+		case <-ctx.Done():
+			return v, at, false
+		case <-s.done:
+			return v, at, false
+		}
+	}
 }
 
 // Drain sends every value of the subscription with send, until ctx is done or
