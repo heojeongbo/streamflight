@@ -780,6 +780,72 @@ func TestGroupClose(t *testing.T) {
 	})
 }
 
+// TestGroupIsolation pins that a delivery that stalls stalls only its own key.
+// A Block subscriber holds the key's lock for as long as it is full, so
+// anything the Group does under its own lock must never wait for a key's lock.
+func TestGroupIsolation(t *testing.T) {
+	// stall opens "stalled" with a delivery parked on a Block subscriber that
+	// nobody reads, and returns once the emitting goroutine holds the key's
+	// lock. Then it wedges a second subscriber of that same key against it,
+	// which is what used to take the Group's lock and wait for the key's.
+	stall := func(t *testing.T, g *streamflight.Group[string, int], r *recorder) {
+		t.Helper()
+
+		// Delivered to before the Block subscriber, so it reports that the
+		// emitting goroutine is inside the delivery loop, holding the lock.
+		entered := make(chan struct{}, 8)
+		_, err := g.SubscribeFunc("stalled", func(int) { entered <- struct{}{} })
+		require.NoError(t, err)
+		_, err = g.Subscribe("stalled", streamflight.WithOverflow(streamflight.Block))
+		require.NoError(t, err)
+
+		r.emit("stalled", 1) // fills the Block subscriber's queue
+		<-entered
+		go r.emit("stalled", 2) // parks on it, holding the key's lock
+		<-entered
+
+		go g.Subscribe("stalled")    // wedges against the parked delivery
+		time.Sleep(time.Millisecond) // let it reach into the Group
+	}
+
+	// within reports rather than hanging the suite when the Group is frozen.
+	// It must not Fatal: the cleanup that would follow needs the Group too.
+	within := func(t *testing.T, what string, fn func()) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() { defer close(done); fn() }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Errorf("%s did not return: one key's stalled delivery froze the whole Group", what)
+		}
+	}
+
+	t.Run("a stalled delivery does not block another key", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+		stall(t, g, r)
+
+		within(t, "Subscribe on an unrelated key", func() {
+			s, err := g.Subscribe("other")
+			x.NoError(err)
+			x.NoError(s.Close())
+		})
+		within(t, "Close", func() { x.NoError(g.Close()) })
+	})
+	t.Run("a stalled delivery does not block closing the group", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+		stall(t, g, r)
+
+		// Closing the Group is one of the three things documented to release a
+		// Block delivery, so it must not be the thing the delivery blocks.
+		within(t, "Close", func() { x.NoError(g.Close()) })
+	})
+}
+
 func TestHooks(t *testing.T) {
 	x := require.New(t)
 	boom := errors.New("boom")

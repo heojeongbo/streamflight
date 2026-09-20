@@ -4,6 +4,7 @@ import (
 	"io"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,6 +25,10 @@ type flight[K comparable, T any] struct {
 	gen     uint64 // bumped whenever a linger timer is armed or disarmed
 	timer   *time.Timer
 	stopped bool
+
+	// ended mirrors done so the Group can tell whether this flight has ended
+	// without waiting for a delivery that is holding mu. Written under mu.
+	ended atomic.Bool
 
 	// mu guards the fields below and is held for every delivery.
 	mu     sync.Mutex
@@ -105,6 +110,12 @@ func (f *flight[K, T]) unblock() {
 // finish ends every subscriber with err and drops what is kept for Replay.
 // f.mu must be held.
 func (f *flight[K, T]) finish(err error) {
+	// Before anything else: the Group reads this without taking f.mu, which is
+	// what keeps a stalled delivery from stalling every other key. Do not
+	// derive it from quit instead: End closes quit before calling finish, so a
+	// quit-based check would let the Group end subscribers with a nil reason in
+	// between, rather than with err.
+	f.ended.Store(true)
 	f.done = true
 	f.endErr = err
 	for _, s := range f.subs {
@@ -113,12 +124,6 @@ func (f *flight[K, T]) finish(err error) {
 	f.subs = nil
 	f.ring = nil
 	f.count = 0
-}
-
-func (f *flight[K, T]) ended() bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.done
 }
 
 // attach adds s, first sending it what Replay and Initial have for it.

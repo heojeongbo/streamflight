@@ -147,7 +147,7 @@ func (g *Group[K, T]) acquire(key K) (*flight[K, T], error) {
 	}
 
 	f := g.flights[key]
-	if f != nil && f.ended() {
+	if f != nil && f.ended.Load() {
 		// Stop an upstream that ended by itself before opening its successor,
 		// so open never overtakes stop for the same key.
 		g.stopLocked(f, nil)
@@ -199,7 +199,7 @@ func (g *Group[K, T]) release(f *flight[K, T]) error {
 		return nil
 	}
 
-	if g.Linger > 0 && !f.stopped && !f.ended() {
+	if g.Linger > 0 && !f.stopped && !f.ended.Load() {
 		f.gen++
 		gen := f.gen
 		f.timer = time.AfterFunc(g.Linger, func() { g.expire(f, gen) })
