@@ -17,6 +17,10 @@ var (
 	// ErrGroupClosed is returned by Subscribe on a closed Group, and is why its
 	// subscriptions ended when it was closed.
 	ErrGroupClosed = errors.New("streamflight: group closed")
+
+	// ErrPollInterval is why opening a key failed when [Poll] was given an
+	// interval that is not positive, which would spin instead of polling.
+	ErrPollInterval = errors.New("streamflight: poll interval must be positive")
 )
 
 // state is where a flight is in its life.
@@ -57,7 +61,20 @@ type Group[K comparable, T any] struct {
 	// Use it for state that is published only on change, where a late
 	// subscriber would otherwise see nothing until the next change. Do not use
 	// it for events: a replayed event is an old event delivered as a new one.
+	//
+	// Set ReplayFor instead when the answer depends on the key.
 	Replay int
+
+	// ReplayFor, if set, is Replay for one key, and replaces it. Use it when
+	// only some keys are state a late subscriber has to be caught up on: a
+	// topic published on change wants 1, a stream of events on the same Group
+	// wants 0, and neither needs a Group of its own.
+	//
+	// It is called once per upstream, as the key is opened, with no Group lock
+	// held and possibly at the same time as another key's. What it returns is
+	// that upstream's for as long as the upstream lives, lingering included. It
+	// must not call back into the Group.
+	ReplayFor func(key K) int
 
 	// Initial, if set, is called for each subscriber that joins a key, after
 	// Replay and before any live value, to send it values no other subscriber
@@ -295,6 +312,10 @@ func (g *Group[K, T]) open(key K, f *flight[K, T]) (err error) {
 		f.wakeLocked()
 		g.mu.Unlock()
 	}()
+
+	// Before the Source, which can emit as soon as it has the Emitter, and
+	// outside the lock, so a ReplayFor that takes its time holds up nobody.
+	f.replay()
 
 	stop, err = g.Source(key, f)
 	if g.Hooks.Opened != nil {

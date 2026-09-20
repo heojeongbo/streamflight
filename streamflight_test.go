@@ -341,6 +341,88 @@ func TestSubscription(t *testing.T) {
 	})
 }
 
+func TestDrain(t *testing.T) {
+	t.Run("it sends every value until the context is done", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.Subscribe("k", streamflight.WithBuffer(8))
+		x.NoError(err)
+		defer s.Close()
+		r.emit("k", 1, 2, 3)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		var got []int
+		x.NoError(s.Drain(ctx, func(v int) error {
+			got = append(got, v)
+			if len(got) == 3 {
+				cancel() // the client went away: a clean end, not a failure
+			}
+			return nil
+		}))
+		x.Equal([]int{1, 2, 3}, got)
+	})
+	t.Run("an upstream that ends cleanly is not a failure", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.Subscribe("k", streamflight.WithBuffer(8))
+		x.NoError(err)
+		defer s.Close()
+		r.emit("k", 1)
+		r.emitter("k").End(nil)
+
+		var got []int
+		x.NoError(s.Drain(context.Background(), func(v int) error {
+			got = append(got, v)
+			return nil
+		}))
+		x.Equal([]int{1}, got, "what was queued is sent before the end")
+	})
+	t.Run("it returns why the subscription ended", func(t *testing.T) {
+		x := require.New(t)
+		boom := errors.New("boom")
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		defer s.Close()
+		r.emitter("k").End(boom)
+
+		x.ErrorIs(s.Drain(context.Background(), func(int) error { return nil }), boom)
+	})
+	t.Run("it returns what send returned", func(t *testing.T) {
+		x := require.New(t)
+		boom := errors.New("boom")
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.Subscribe("k", streamflight.WithBuffer(8))
+		x.NoError(err)
+		defer s.Close()
+		r.emit("k", 1, 2)
+
+		n := 0
+		x.ErrorIs(s.Drain(context.Background(), func(int) error { n++; return boom }), boom)
+		x.Equal(1, n, "it stops on the first failure")
+	})
+	t.Run("a function subscription has nothing to drain", func(t *testing.T) {
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{Source: newRecorder().Source}
+
+		s, err := g.SubscribeFunc("k", func(int) {})
+		x.NoError(err)
+		defer s.Close()
+
+		x.PanicsWithValue("streamflight: Drain on a SubscribeFunc subscription", func() {
+			s.Drain(context.Background(), func(int) error { return nil })
+		})
+	})
+}
+
 func TestOverflow(t *testing.T) {
 	t.Run("DropOldest keeps the newest values", func(t *testing.T) {
 		x := require.New(t)
@@ -563,6 +645,72 @@ func TestReplay(t *testing.T) {
 
 		x.NoError(s.Close())
 		x.NoError(keep.Close())
+	})
+}
+
+func TestReplayFor(t *testing.T) {
+	t.Run("a key's replay replaces the Group's", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Replay: 1, // replaced for every key, so never used
+			ReplayFor: func(key string) int {
+				if key == "state" {
+					return 2
+				}
+				return 0 // an event replayed is an old event delivered as new
+			},
+		}
+
+		state, err := g.SubscribeFunc("state", func(int) {})
+		x.NoError(err)
+		events, err := g.SubscribeFunc("events", func(int) {})
+		x.NoError(err)
+		r.emit("state", 1, 2, 3)
+		r.emit("events", 7, 8)
+
+		var late, none collector
+		sl, err := g.SubscribeFunc("state", late.Add)
+		x.NoError(err)
+		x.Equal([]int{2, 3}, late.Values(), "the last two, on one Group")
+
+		sn, err := g.SubscribeFunc("events", none.Add)
+		x.NoError(err)
+		x.Empty(none.Values(), "and nothing at all on another")
+
+		for _, s := range []*streamflight.Subscription[int]{state, events, sl, sn} {
+			x.NoError(s.Close())
+		}
+	})
+	t.Run("it runs once per upstream, outside the Group lock", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		var keys []string
+		g := &streamflight.Group[string, int]{Source: r.Source}
+		g.ReplayFor = func(key string) int {
+			keys = append(keys, key)
+			// Free to use the Group: no lock of its own is held.
+			if key == "a" {
+				s, err := g.Subscribe("b")
+				x.NoError(err)
+				x.NoError(s.Close())
+			}
+			return 1
+		}
+
+		a, err := g.Subscribe("a")
+		x.NoError(err)
+		b, err := g.Subscribe("a")
+		x.NoError(err)
+		x.Equal([]string{"a", "b"}, keys, "once for the upstream, not once per subscriber")
+
+		x.NoError(a.Close())
+		x.NoError(b.Close())
+		c, err := g.Subscribe("a")
+		x.NoError(err)
+		x.Equal([]string{"a", "b", "a", "b"}, keys, "and again for a fresh upstream")
+		x.NoError(c.Close())
 	})
 }
 
@@ -1483,6 +1631,112 @@ func soak(t *testing.T, linger time.Duration) {
 	}
 	t.Logf("%d clients x %d rounds over %d keys: %d upstreams opened and stopped",
 		clients, rounds, keys, u.opens)
+}
+
+func TestPoll(t *testing.T) {
+	t.Run("the first tick is on open and the next an interval after the last returned", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			// The first tick outruns the interval. A Ticker would have kept the
+			// tick it missed and fired again at once, leaving no idle at all.
+			var at []time.Duration
+			start := time.Now()
+			g := &streamflight.Group[string, int]{
+				Replay: 4,
+				Source: streamflight.Poll(time.Second,
+					func(_ context.Context, _ string, e streamflight.Emitter[int]) error {
+						at = append(at, time.Since(start))
+						if len(at) == 1 {
+							time.Sleep(3 * time.Second)
+						}
+						e.Emit(len(at))
+						return nil
+					}),
+			}
+
+			s, err := g.Subscribe("k", streamflight.WithBuffer(8))
+			x.NoError(err)
+			time.Sleep(5500 * time.Millisecond)
+			synctest.Wait()
+
+			x.Equal([]time.Duration{0, 4 * time.Second, 5 * time.Second}, at,
+				"quiet time between calls, not a deadline the work can miss")
+			x.NoError(s.Close())
+			x.NoError(g.Close())
+		})
+	})
+	t.Run("the opener receives the first tick through Replay", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			g := &streamflight.Group[string, int]{
+				Replay: 1,
+				Source: streamflight.Poll(time.Hour,
+					func(_ context.Context, _ string, e streamflight.Emitter[int]) error {
+						e.Emit(7)
+						return nil
+					}),
+			}
+
+			s, err := g.Subscribe("k")
+			x.NoError(err)
+			x.Equal(7, <-s.C, "on open, not after one interval")
+			x.NoError(s.Close())
+		})
+	})
+	t.Run("the poll stops with its key", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			ticks := 0
+			g := &streamflight.Group[string, int]{
+				Replay: 1,
+				Source: streamflight.Poll(time.Second,
+					func(_ context.Context, _ string, e streamflight.Emitter[int]) error {
+						ticks++
+						e.Emit(ticks)
+						return nil
+					}),
+			}
+
+			s, err := g.Subscribe("k", streamflight.WithBuffer(8))
+			x.NoError(err)
+			time.Sleep(2500 * time.Millisecond)
+			synctest.Wait()
+			x.NoError(s.Close())
+
+			was := ticks
+			time.Sleep(5 * time.Second)
+			synctest.Wait()
+			x.Equal(was, ticks, "nothing polls a key nobody holds")
+		})
+	})
+	t.Run("a tick that fails ends the upstream with its error", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			boom := errors.New("boom")
+			g := &streamflight.Group[string, int]{
+				Source: streamflight.Poll(time.Second,
+					func(context.Context, string, streamflight.Emitter[int]) error { return boom }),
+			}
+
+			s, err := g.Subscribe("k")
+			x.NoError(err)
+			synctest.Wait()
+			<-s.Done()
+			x.ErrorIs(s.Err(), boom)
+			x.NoError(s.Close())
+		})
+	})
+	t.Run("an interval that is not positive fails the subscribe", func(t *testing.T) {
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{
+			Source: streamflight.Poll(0,
+				func(context.Context, string, streamflight.Emitter[int]) error { return nil }),
+		}
+
+		s, err := g.Subscribe("k")
+		x.ErrorIs(err, streamflight.ErrPollInterval, "spinning is not a poll")
+		x.Nil(s)
+	})
 }
 
 func TestRun(t *testing.T) {

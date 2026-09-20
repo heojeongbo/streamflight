@@ -64,22 +64,67 @@ for b := range sub.C {
 return sub.Err() // why it ended: io.EOF, the upstream's error, ErrEvicted, ...
 ```
 
-A Source that runs a loop, such as a poller, is written with `Run`:
+A Source whose upstream is a repeated request rather than a subscription is
+written with `Poll`:
+
+```go
+Replay: 1, // the first tick runs before the opening subscriber is attached
+Source: streamflight.Poll(3*time.Second,
+	func(ctx context.Context, host string, e streamflight.Emitter[Status]) error {
+		e.Emit(poll(ctx, host))
+		return nil
+	}),
+```
+
+The first call is on open, so a subscriber sees something immediately, and the
+next is an interval after the last one *returned* — not a `time.Ticker`, which
+keeps the tick a slow call missed and fires again at once, leaving a poll that
+outruns its interval running back to back with no idle at all.
+
+A Source that runs its own loop is written with `Run` instead:
 
 ```go
 Source: streamflight.Run(func(ctx context.Context, host string, e streamflight.Emitter[Status]) error {
-	tick := time.NewTicker(3 * time.Second)
-	defer tick.Stop()
 	for {
-		select {
-		case <-ctx.Done(): // the last subscriber left
-			return nil
-		case <-tick.C:
-			e.Emit(poll(host))
+		v, err := conn.Read(ctx) // whatever blocks until the next value
+		if err != nil {
+			return err // the upstream ends; subscribers see this error
 		}
+		e.Emit(v)
 	}
 }),
 ```
+
+## Relaying to a client
+
+A handler that relays one key to one client is `Drain`:
+
+```go
+func (s *Server) Watch(req *Request, stream grpc.ServerStreamingServer[Status]) error {
+	sub, err := s.group.Subscribe(req.Key, streamflight.WithBuffer(16))
+	if err != nil {
+		return err
+	}
+	defer sub.Close()
+	return sub.Drain(stream.Context(), stream.Send)
+}
+```
+
+`send` is a `func(T) error`, so it is whatever the protocol's write is — no
+interface to satisfy and nothing for this package to know about:
+
+| Sink | `send` |
+|---|---|
+| gRPC server stream | `stream.Send` |
+| WebRTC data channel | `func(b []byte) error { return dc.Send(b) }` |
+| WebRTC media track | `func(b []byte) error { _, err := track.Write(b); return err }` |
+| WebSocket | `func(b []byte) error { return c.WriteMessage(websocket.BinaryMessage, b) }` |
+| SSE | `func(v Event) error { if err := enc.Encode(v); err != nil { return err }; f.Flush(); return nil }` |
+
+`send` runs on the caller's goroutine, so it may block: no other subscriber of
+the key waits for it, and this subscription's `Overflow` policy decides what
+falling behind costs. That is why a network write belongs here and not in
+`SubscribeFunc`.
 
 ## Choosing the behaviour
 
@@ -96,8 +141,10 @@ subscriber of the key. `Subscribe` queues on a channel instead, and its
 | `Evict` | closes the subscriber with `ErrEvicted` | deltas, where a gap corrupts everything after it |
 
 **Late subscribers.** `Group.Replay` sends a joining subscriber the latest
-values, for state that is only published when it changes. `Group.Initial` sends
-it anything else first, such as a snapshot for a stream of deltas.
+values, for state that is only published when it changes — or `Group.ReplayFor`
+when only some keys are state, so that a topic wanting 1 and an event stream
+wanting 0 can share one Group. `Group.Initial` sends it anything else first,
+such as a snapshot for a stream of deltas.
 
 **Churn.** `Group.Linger` keeps an upstream running for a while after its last
 subscriber leaves, so a reloaded page reuses it instead of opening it again.

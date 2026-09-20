@@ -54,15 +54,24 @@ const (
 )
 
 func newFlight[K comparable, T any](g *Group[K, T], key K) *flight[K, T] {
-	f := &flight[K, T]{
+	return &flight[K, T]{
 		g:    g,
 		key:  key,
 		quit: make(chan struct{}),
 	}
-	if g.Replay > 0 {
-		f.ring = make([]T, g.Replay)
+}
+
+// replay sizes the ring this flight remembers for a late subscriber. Called by
+// open, before the Source can emit and while nothing else can reach f, so it
+// needs no lock and can run the caller's ReplayFor outside the Group's.
+func (f *flight[K, T]) replay() {
+	n := f.g.Replay
+	if f.g.ReplayFor != nil {
+		n = f.g.ReplayFor(f.key)
 	}
-	return f
+	if n > 0 {
+		f.ring = make([]T, n)
+	}
 }
 
 func (f *flight[K, T]) Emit(v T) int {

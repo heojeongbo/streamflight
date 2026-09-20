@@ -1,6 +1,9 @@
 package streamflight
 
 import (
+	"context"
+	"errors"
+	"io"
 	"sync"
 	"sync/atomic"
 )
@@ -115,6 +118,50 @@ func (s *Subscription[T]) Err() error {
 // Dropped counts the values this subscriber lost to its Overflow policy.
 func (s *Subscription[T]) Dropped() uint64 {
 	return s.dropped.Load()
+}
+
+// Drain sends every value of the subscription with send, until ctx is done or
+// the subscription ends. It is the body of a handler that relays one key to one
+// client.
+//
+// It returns nil when ctx is done and nil when the upstream ended cleanly,
+// which are the two ordinary ways a relay finishes: the client went away, or
+// there is nothing left to send. Otherwise it returns the first error send
+// returned, or why the subscription ended: [ErrEvicted], [ErrGroupClosed], or
+// the error the upstream ended with. Values already queued when the upstream
+// ended are sent before that. Use [Subscription.Err] to tell a client that went
+// away from a clean end.
+//
+// send runs on the caller's goroutine, one value at a time, so it may block: no
+// other subscriber of the key waits for it, and this subscription's [Overflow]
+// policy decides what falling behind costs. That is why a network write belongs
+// here rather than in [Group.SubscribeFunc], where it would hold up everyone.
+// send is any protocol's write: a method value where the shape already fits, a
+// two-line closure where it does not.
+//
+// Drain does not close the subscription. The caller still owns it, and may
+// Drain it again. It panics on a subscription from [Group.SubscribeFunc], which
+// has no channel to drain.
+func (s *Subscription[T]) Drain(ctx context.Context, send func(T) error) error {
+	if s.ch == nil {
+		panic("streamflight: Drain on a SubscribeFunc subscription")
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case v, ok := <-s.ch:
+			if !ok {
+				if err := s.Err(); !errors.Is(err, io.EOF) {
+					return err
+				}
+				return nil
+			}
+			if err := send(v); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 // Close ends the subscription and releases its hold on the upstream. The last

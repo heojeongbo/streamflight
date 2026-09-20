@@ -3,6 +3,7 @@ package streamflight_test
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/heojeongbo/streamflight"
 )
@@ -89,4 +90,38 @@ func ExampleRun() {
 	// 2
 	// 3
 	// EOF
+}
+
+// A handler relaying one key to one client. send is whatever the protocol's
+// write is: a gRPC stream's Send fits as a method value, and anything else is
+// a closure.
+func ExampleSubscription_Drain() {
+	g := &streamflight.Group[string, string]{
+		Replay: 1, // Poll's first tick runs before the opener is attached
+		Source: streamflight.Poll(time.Hour,
+			func(_ context.Context, key string, e streamflight.Emitter[string]) error {
+				e.Emit("status of " + key)
+				return nil
+			}),
+	}
+	defer g.Close()
+
+	sub, err := g.Subscribe("robot-1", streamflight.WithBuffer(8))
+	if err != nil {
+		return
+	}
+	defer sub.Close()
+
+	// Stop after the first value, the way a client going away would.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fmt.Println(sub.Drain(ctx, func(v string) error {
+		fmt.Println(v)
+		cancel()
+		return nil
+	}))
+
+	// Output:
+	// status of robot-1
+	// <nil>
 }

@@ -1,6 +1,9 @@
 package streamflight
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Source opens the upstream of key. It is called once per upstream, by the
 // first subscriber of the key, and must deliver values through e until stop is
@@ -51,5 +54,62 @@ func Run[K comparable, T any](run func(ctx context.Context, key K, e Emitter[T])
 			<-done
 			return nil
 		}, nil
+	}
+}
+
+// Poll makes a [Source] out of a function called on an interval, for an
+// upstream that is a repeated request rather than a subscription: an HTTP
+// backend, a query, a value sampled at a rate.
+//
+// tick is called once as soon as the key is opened, so a subscriber has
+// something on open instead of after one interval, and then interval after the
+// previous call returned. Not on a [time.Ticker]: a Ticker keeps the tick a
+// slow call missed and fires again at once, so a call that outruns interval
+// leaves the loop running back to back with no idle at all. Scheduling from the
+// return guarantees interval of quiet between calls, whatever a call costs.
+//
+// Pair it with [Group.Replay] of at least 1. The first tick runs before the
+// subscriber that opened the key is attached, so the ring is what holds that
+// first value for it.
+//
+// A tick that returns an error ends the upstream with it, closing every
+// subscriber; the next subscriber opens a fresh one. To make a failure a value
+// instead, which is usually right for a backend expected to come back, emit it
+// and return nil: ending the stream would turn one outage into a reconnect
+// loop. A tick with nothing to report simply does not emit.
+//
+// The interval belongs to the upstream, as does anything a tick remembers
+// between calls, such as the last value it sent. Both live in a Source that
+// closes over them, since a Source runs once per upstream and Poll returns one.
+//
+// Opening a key whose interval is not positive fails with [ErrPollInterval]
+// rather than spinning.
+func Poll[K comparable, T any](
+	interval time.Duration,
+	tick func(ctx context.Context, key K, e Emitter[T]) error,
+) Source[K, T] {
+	run := Run(func(ctx context.Context, key K, e Emitter[T]) error {
+		// Zero, so the first tick is on open; reset after the work, so the
+		// interval is quiet time rather than a deadline the work can miss.
+		t := time.NewTimer(0)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-t.C:
+			}
+			if err := tick(ctx, key, e); err != nil {
+				return err
+			}
+			t.Reset(interval)
+		}
+	})
+
+	return func(key K, e Emitter[T]) (func() error, error) {
+		if interval <= 0 {
+			return nil, ErrPollInterval
+		}
+		return run(key, e)
 	}
 }

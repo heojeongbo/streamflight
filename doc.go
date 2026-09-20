@@ -29,9 +29,21 @@
 // values ([DropOldest], the default), keep the oldest ([DropNewest]), wait for
 // it ([Block]), or cut it off ([Evict]).
 //
+// [Subscription.Drain] is that channel pumped into a sink until a context ends,
+// which is what a handler relaying one key to one client does. A write that can
+// block belongs there rather than in SubscribeFunc, where it would hold up
+// every other subscriber of the key. The sink is a func(T) error, so any
+// protocol fits: a method value where the shape already matches, a two-line
+// closure where it does not.
+//
 // A subscriber that joins a running upstream can first be sent what it missed:
-// the latest values ([Group.Replay]) or a snapshot of the current state
-// ([Group.Initial]).
+// the latest values ([Group.Replay], or [Group.ReplayFor] when it depends on
+// the key) or a snapshot of the current state ([Group.Initial]).
+//
+// A [Source] is written from whatever the upstream is. [Run] makes one out of a
+// loop that produces values until its context is done; [Poll] out of a function
+// called on an interval, for an upstream that is a repeated request rather than
+// a subscription.
 //
 // # Guarantees
 //
@@ -55,11 +67,12 @@
 //     call back into the Group, and neither may Close be called from inside a
 //     SubscribeFunc function: both deadlock.
 //   - Open and stop run with no Group lock held, and different keys open and
-//     stop at the same time. A [Source], its stop func and any goroutine they
-//     own may use the Group: they may subscribe to other keys, and may close
-//     any subscription. They must not subscribe to their own key or close the
-//     Group, because a key is held from the moment it starts opening until its
-//     stop func has returned, so either call would wait for itself.
+//     stop at the same time. A [Source], [Group.ReplayFor], its stop func and
+//     any goroutine they own may use the Group: they may subscribe to other
+//     keys, and may close any subscription. They must not subscribe to their
+//     own key or close the Group, because a key is held from the moment it
+//     starts opening until its stop func has returned, so either call would
+//     wait for itself.
 //   - A stop func must return. Its key is unavailable until it does, and
 //     [Group.Close] waits for it, but no other key is held up by it.
 //   - Subscribe waits while another goroutine is opening or stopping the same
