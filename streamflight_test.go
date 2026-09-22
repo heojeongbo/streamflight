@@ -537,6 +537,54 @@ func TestSubscribeLatest(t *testing.T) {
 		x.PanicsWithValue(msg, func() { ch.Latest() })
 		x.PanicsWithValue(msg, func() { fn.Latest() })
 	})
+	t.Run("a value is the key's newest before any subscriber is delivered to", func(t *testing.T) {
+		// One subscription carries the state, another the edge. A hook woken by
+		// a value must read that value, not the one before it, or a consumer
+		// that diffs against Latest when it wakes suppresses the transition.
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		sampler, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		defer sampler.Close()
+
+		var sawWhenWoken []int
+		edge, err := g.SubscribeFunc("k", func(int) {
+			v, _, ok := sampler.Latest()
+			x.True(ok, "the value that woke this hook is not stored yet")
+			sawWhenWoken = append(sawWhenWoken, v)
+		})
+		x.NoError(err)
+		defer edge.Close()
+
+		r.emit("k", 1, 2, 3)
+		x.Equal([]int{1, 2, 3}, sawWhenWoken, "each wake-up read its own value")
+	})
+	t.Run("Now is where the arrival time comes from", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		stale := time.Now().Add(-time.Hour)
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Now:    func() time.Time { return stale },
+		}
+
+		s, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		defer s.Close()
+
+		r.emit("k", 1)
+		_, at, ok := s.Latest()
+		x.True(ok)
+		x.Equal(stale, at, "a test can age a value")
+
+		// Still strictly increasing, so waiting past one ends even on a clock
+		// that never moves.
+		r.emit("k", 2)
+		_, next, _ := s.Latest()
+		x.True(next.After(at))
+	})
 	t.Run("Wait blocks until a value newer than the one already there", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			x := require.New(t)

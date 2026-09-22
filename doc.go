@@ -63,6 +63,10 @@
 //   - Values reach every subscriber of a key in the order they were emitted, and
 //     a subscriber is never delivered to concurrently, even when the Source
 //     emits from several goroutines.
+//   - A value becomes the key's newest before it is delivered to any subscriber.
+//     A subscriber woken by a value therefore reads that same value from
+//     [Subscription.Latest], never the one before it, which is what lets one
+//     subscription carry the state and another the edge.
 //   - After [Subscription.Close] returns, its subscriber is never delivered to
 //     again. A delivery in progress completes first.
 //   - Values emitted after the upstream is stopped or has ended are dropped.

@@ -109,7 +109,7 @@ func (f *flight[K, T]) Emit(v T) int {
 		// times it can tell apart, or waiting for one past the other never
 		// ends. The nudge is a nanosecond and only under a clock too coarse to
 		// separate two emissions.
-		at := time.Now()
+		at := f.g.now()
 		if f.latestOK && !at.After(f.latestAt) {
 			at = f.latestAt.Add(time.Nanosecond)
 		}

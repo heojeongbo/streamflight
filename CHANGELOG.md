@@ -4,7 +4,7 @@
 
 A third delivery shape, and three things every consumer was writing by hand,
 taken from a real one. Purely additive: nothing to rewrite, and the only change
-to the exported surface is seven new names.
+to the exported surface is eight new names.
 
 ### Added
 
@@ -71,8 +71,19 @@ to the exported surface is seven new names.
   1 and a stream of events that wants 0 can now share one Group rather than
   needing one each. It runs with no Group lock held, like `Source`.
 
+- **`Group.Now`** — where a value gets the arrival time `Latest` reports and
+  `Wait` waits past; defaults to `time.Now`. Set it to age a value from a test,
+  because whether a value is still current is the caller's to decide and
+  deciding it is worth a test. A key nobody samples never calls it.
+
 - **`ErrPollInterval`** — why opening a key fails when `Poll` was given an
   interval that is not positive, rather than spinning.
+
+- A guarantee: **a value becomes the key's newest before it is delivered to any
+  subscriber.** A subscriber woken by a value therefore reads that same value
+  from `Latest`, never the one before it — which is what lets one subscription
+  carry the state and another the edge, the shape a latch with a change hook
+  needs. The implementation already did this; now it is promised.
 
 ### Fixed
 

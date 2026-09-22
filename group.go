@@ -94,6 +94,16 @@ type Group[K comparable, T any] struct {
 	// Hooks observe the Group, for logging and metrics.
 	Hooks Hooks[K, T]
 
+	// Now, if set, is where a value gets the arrival time that
+	// [Subscription.Latest] reports and [Subscription.Wait] waits past.
+	// Defaults to time.Now.
+	//
+	// Set it to age a value from a test: whether a value is still current is
+	// the caller's to decide, and deciding it is worth a test. It is called
+	// while the key's values are being published, so keep it short and do not
+	// call back into the Group. A key nobody samples never calls it.
+	Now func() time.Time
+
 	mu        sync.Mutex
 	flights   map[K]*flight[K, T]
 	closeDone chan struct{} // non-nil once a Close has started
@@ -348,6 +358,14 @@ func (g *Group[K, T]) open(key K, f *flight[K, T]) (err error) {
 	// publishing it live with no stop func would leak the upstream.
 	opened = true
 	return nil
+}
+
+// now is when a value arrived, from the Group's clock or the real one.
+func (g *Group[K, T]) now() time.Time {
+	if g.Now != nil {
+		return g.Now()
+	}
+	return time.Now()
 }
 
 // claimLocked moves f from live to stopping, disarming its linger timer.
