@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -2147,9 +2148,14 @@ func TestPanics(t *testing.T) {
 		})
 	})
 	t.Run("a second stop that panics while Close finishes still leaves nothing running", func(t *testing.T) {
-		// Which opening key Close waits on first follows map order, so go
-		// round enough times to take both.
-		for range 20 {
+		// Close waits on whichever opening key it finds first. Only when that
+		// is b does b's stop panic inside Close's re-run while c is still
+		// opening, the order that needs the re-run to guard itself too, and
+		// scheduling makes that about one round in eight. So go round until
+		// both orders have come up.
+		nested, rounds := 0, 0
+		for rounds < 1000 && (nested == 0 || nested == rounds) {
+			rounds++
 			synctest.Test(t, func(t *testing.T) {
 				x := require.New(t)
 				r := newRecorder()
@@ -2189,6 +2195,9 @@ func TestPanics(t *testing.T) {
 				synctest.Wait()
 				close(gates["b"])
 				synctest.Wait()
+				if slices.Contains(r.Log(), "stop b") {
+					nested++ // stopped with c still opening
+				}
 				close(gates["c"])
 
 				x.NotNil(<-closed)
@@ -2203,6 +2212,8 @@ func TestPanics(t *testing.T) {
 				x.NoError(a.Close())
 			})
 		}
+		require.Positive(t, nested, "the order that needs the nested re-run never came up")
+		require.Less(t, nested, rounds, "and neither did the other")
 	})
 }
 

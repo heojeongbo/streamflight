@@ -131,8 +131,8 @@ type Group[K comparable, T any] struct {
 //
 // A hook that panics fails the call that reported it: the Group is not left
 // locked and nobody is left waiting on a key, but a key whose Opened, Joined
-// or Left panicked may go on running until its next subscriber leaves it or
-// the Group is closed. A Stopped hook called when a key's Linger runs out runs
+// or Left panicked may go on running until its next subscriber leaves it (and
+// then its Linger runs out) or the Group is closed. A Stopped hook called when a key's Linger runs out runs
 // on a goroutine the package started, where there is no call to fail and a
 // panic crashes the program. A Dropped hook that panics fails the Emit that
 // reached it, which on the goroutine of a [Run] or [Poll] function crashes the

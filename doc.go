@@ -133,7 +133,8 @@
 //     [Group.Now], a SubscribeFunc function, a Source or a stop func, fails the
 //     call it ran in: the Group is not left locked, and nobody is left waiting
 //     on a key. A key whose Opened, Joined or Left hook panicked may go on
-//     running until its next subscriber leaves it or the Group is closed, and
+//     running until its next subscriber leaves it (and then its Linger runs
+//     out) or the Group is closed, and
 //     whatever a Source or stop func had started and not stopped when it
 //     panicked, the Group never stops. On a goroutine the package starts there
 //     is no call to fail, and a panic crashes the program as on any goroutine:

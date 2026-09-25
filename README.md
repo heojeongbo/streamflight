@@ -275,8 +275,8 @@ it, such as a socket or a device, is a `Group[struct{}, T]` subscribed to with
   shared by the whole Group, so keep them short.
 - A panic in your code fails the call it ran in. The Group is not left locked
   and nobody is left waiting on a key. A key whose `Opened`, `Joined` or `Left`
-  hook panicked may run until its next subscriber leaves or the Group is
-  closed, and whatever a `Source` or `stop` had started and not stopped when it
+  hook panicked may run until its next subscriber leaves (and then its `Linger`
+  runs out) or the Group is closed, and whatever a `Source` or `stop` had started and not stopped when it
   panicked, the Group never stops. On a goroutine the package starts — the
   timer that stops a key once its `Linger` runs out, which calls `stop` and
   `Stopped`, or the one `Run` and `Poll` call their function on — there is no
