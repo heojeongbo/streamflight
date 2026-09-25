@@ -212,25 +212,48 @@ func (f *flight[K, T]) attach(s *Subscription[T]) {
 	}
 
 	// Never wait on a subscriber that cannot read yet: it is still inside
-	// Subscribe. A queue shorter than what is sent keeps the newest.
-	for i := range f.count {
-		f.push(s, f.ring[(f.head-f.count+i+len(f.ring))%len(f.ring)], DropOldest)
+	// Subscribe. A queue shorter than what is sent keeps the newest, unless a
+	// gap would corrupt what follows it: Evict ends the subscriber for a gap in
+	// what it catches up on, as it would for one in what arrives live.
+	policy := DropOldest
+	if s.overflow == Evict {
+		policy = Evict
 	}
-	if f.g.Initial != nil {
-		// send borrows the key's lock, which is held only for this call. A
-		// retained send would otherwise deliver without it, racing the whole
-		// key and panicking on a queue that has since been closed.
-		var live atomic.Bool
-		live.Store(true)
-		f.g.Initial(f.key, func(v T) {
-			if !live.Load() {
-				panic("streamflight: Group.Initial called send after returning")
-			}
-			f.push(s, v, DropOldest)
-		})
-		live.Store(false)
+	cut := false
+	for i := 0; i < f.count && !cut; i++ {
+		cut = f.push(s, f.ring[(f.head-f.count+i+len(f.ring))%len(f.ring)], policy) == evicted
+	}
+	if f.g.Initial != nil && !cut {
+		cut = f.initial(s, policy)
+	}
+	if cut {
+		// Never added, so Close only has to give back its reference.
+		s.end(ErrEvicted)
+		return
 	}
 	f.subs = append(f.subs, s)
+}
+
+// initial sends s what Initial has for it, and reports whether that cut s off.
+// A method of its own so that what its send captures is allocated only for a
+// Group that has an Initial. f.mu must be held.
+func (f *flight[K, T]) initial(s *Subscription[T], policy Overflow) (cut bool) {
+	// send borrows the key's lock, which is held only for this call. A retained
+	// send would otherwise deliver without it, racing the whole key and
+	// panicking on a queue that has since been closed. Deferred, so a send kept
+	// by an Initial that panicked is refused too.
+	var live atomic.Bool
+	live.Store(true)
+	defer live.Store(false)
+	f.g.Initial(f.key, func(v T) {
+		if !live.Load() {
+			panic("streamflight: Group.Initial called send after returning")
+		}
+		if !cut {
+			cut = f.push(s, v, policy) == evicted
+		}
+	})
+	return cut
 }
 
 func (f *flight[K, T]) leave(s *Subscription[T]) error {

@@ -817,6 +817,63 @@ func TestOverflow(t *testing.T) {
 		x.ErrorIs(slow.Err(), streamflight.ErrEvicted, "close does not rewrite why it ended")
 		x.Equal([]string{"open k", "stop k"}, r.Log())
 	})
+	t.Run("Evict ends a subscriber whose catch-up does not fit its queue", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		initials := 0
+		g := &streamflight.Group[string, int]{
+			Source:  r.Source,
+			Replay:  3,
+			Initial: func(string, func(int)) { initials++ },
+		}
+
+		var keep collector
+		k, err := g.SubscribeFunc("k", keep.Add)
+		x.NoError(err)
+		r.emit("k", 1, 2, 3)
+		x.Equal(1, initials)
+
+		s, err := g.Subscribe("k", streamflight.WithBuffer(2), streamflight.WithOverflow(streamflight.Evict))
+		x.NoError(err, "returned already ended, like a subscription to an upstream that has ended")
+		x.ErrorIs(s.Err(), streamflight.ErrEvicted, "a gap in the catch-up is a gap like any other")
+		x.Equal([]int{1, 2}, drain(s.C), "what fitted before the gap")
+		x.Zero(s.Dropped(), "cut off, not dropped from")
+		x.Equal(1, initials, "nothing more is sent to a subscriber that is gone")
+
+		x.Equal(1, r.emit("k", 4), "and nothing live")
+		x.Equal([]int{1, 2, 3, 4}, keep.Values(), "nobody else is affected")
+		x.NoError(s.Close())
+		x.Equal([]string{"open k"}, r.Log(), "Close gave back its reference, and k still holds the key")
+		x.NoError(k.Close())
+		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
+	t.Run("Evict ends a subscriber whose Initial does not fit its queue", func(t *testing.T) {
+		x := require.New(t)
+		sends := 0
+		g := &streamflight.Group[string, int]{
+			Source: newRecorder().Source,
+			Initial: func(_ string, send func(int)) {
+				for v := 1; v <= 3; v++ {
+					send(v)
+					sends++
+				}
+			},
+		}
+
+		whole, err := g.Subscribe("k", streamflight.WithBuffer(3), streamflight.WithOverflow(streamflight.Evict))
+		x.NoError(err)
+		x.NoError(whole.Err(), "a snapshot that fits is received whole")
+		x.Equal([]int{1, 2, 3}, drain(whole.C))
+
+		cut, err := g.Subscribe("k", streamflight.WithBuffer(2), streamflight.WithOverflow(streamflight.Evict))
+		x.NoError(err)
+		x.ErrorIs(cut.Err(), streamflight.ErrEvicted, "a truncated snapshot is a corrupt base")
+		x.Equal([]int{1, 2}, drain(cut.C))
+		x.Equal(6, sends, "a send after the cut does nothing, and does not panic")
+
+		x.NoError(cut.Close())
+		x.NoError(whole.Close())
+	})
 	t.Run("Block waits for the subscriber to make room", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			x := require.New(t)
