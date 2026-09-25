@@ -33,9 +33,10 @@ type Emitter[T any] interface {
 
 	// End ends the upstream by itself. Every subscriber is closed with err, or
 	// io.EOF if err is nil, and the next subscriber of the key opens a fresh
-	// upstream. The stop func is still called: once every subscriber has been
-	// closed, or when the next subscriber of the key arrives, whichever is
-	// first. Emit and End after the first End do nothing.
+	// upstream. The stop func is still called, at the first of: the last
+	// subscriber closing, or the end of Group.Linger if none was left when End
+	// was called; the next subscriber of the key arriving; and the Group being
+	// closed. Emit and End after the first End do nothing.
 	End(err error)
 }
 

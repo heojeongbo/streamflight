@@ -59,7 +59,8 @@
 // the latest values ([Group.Replay], or [Group.ReplayFor] when it depends on
 // the key) or a snapshot of the current state ([Group.Initial]). A function
 // subscriber is sent them inside SubscribeFunc, on the calling goroutine,
-// before it returns. A sampler is sent neither: it reads what the key keeps.
+// before it returns. A sampler keeps neither: Initial is still called for it,
+// but it reads what the key keeps.
 //
 // A [Source] is written from whatever the upstream is. [Run] makes one out of a
 // loop that produces values until its context is done; [Poll] out of a function
@@ -80,23 +81,30 @@
 //     value therefore reads that same value from [Subscription.Latest], never
 //     the one before it, which is what lets one subscription carry the state
 //     and another the edge. A channel reader, which reads later, reads it or a
-//     newer one.
+//     newer one. This holds for values delivered as they are emitted, not for
+//     what Replay sends a subscriber as it joins, which Latest may already
+//     have moved past.
 //   - After [Subscription.Close] returns, its subscriber is never delivered to
 //     again. A delivery in progress completes first.
 //   - Values emitted after the upstream is stopped or has ended are dropped.
-//   - Keys are independent: opening or stopping one key never waits for
-//     another, and neither does a subscriber that has fallen behind.
+//   - Keys are independent: outside [Group.Close], which stops keys one at a
+//     time, opening or stopping one key never waits for another, and neither
+//     does a subscriber that has fallen behind.
 //
 // # Rules
 //
 //   - Every subscriber of a key receives the same value. Treat it as read-only,
 //     and copy it before mutating.
-//   - Deliveries run on the emitting goroutine while holding the key's lock,
-//     and so do [Group.Initial], [Group.Now] and the Dropped hook. From there it
-//     is safe to read [Subscription.Latest], Err and Dropped, which never wait.
-//     It is not safe to subscribe, to Close a subscription, to call
-//     [Subscription.Wait], to Emit or End on the same key, or to close the
-//     Group: each waits on the lock the delivery holds, and deadlocks.
+//   - Deliveries run while holding the key's lock, on the emitting goroutine or,
+//     for what a subscriber is sent as it joins, on the subscribing one.
+//     [Group.Initial], [Group.Now] and the Dropped hook run under that lock too.
+//     From there it is safe to read [Subscription.Latest], Err and Dropped,
+//     which never wait, and to Emit on another key, which is how a stream
+//     derived from this one is fed, unless what that key delivers leads back
+//     to this one. It is not safe to subscribe or to Close a subscription on
+//     any key, since either can run a Source or stop func that needs this key,
+//     nor to call [Subscription.Wait], Emit or End on the same key, or to close
+//     the Group: each waits on the lock the delivery holds, and deadlocks.
 //   - Open and stop run with no Group lock held, and different keys open and
 //     stop at the same time. A [Source], [Group.ReplayFor], its stop func and
 //     any goroutine they own may use the Group: they may subscribe to other
@@ -105,7 +113,8 @@
 //     starts opening until its stop func has returned, so either call would
 //     wait for itself.
 //   - A stop func must return. Its key is unavailable until it does, and
-//     [Group.Close] waits for it, but no other key is held up by it.
+//     [Group.Close], which stops keys one at a time, waits for it before it
+//     stops the next. Outside Close, no other key is held up by it.
 //   - Subscribe waits while another goroutine is opening or stopping the same
 //     key. It never waits for another key's Source or stop func.
 //   - The Joined and Left hooks run under a lock shared by the whole Group, so
@@ -114,12 +123,17 @@
 //     lock held, Dropped under the key's lock as a delivery does, and every
 //     hook may run concurrently for different keys.
 //   - Always Close a Subscription, including one that has already ended. An
-//     upstream is stopped when all of its subscriptions are closed, when the
-//     Group is closed, or, once it has ended by itself, when the next
-//     subscriber of its key arrives to open a fresh one.
+//     upstream is stopped when all of its subscriptions are closed (after
+//     [Group.Linger], unless it has ended), when the Group is closed, or, once
+//     it has ended by itself, when the next subscriber of its key arrives to
+//     open a fresh one.
 //   - A panic in the caller's code, whether a hook, [Group.Initial],
 //     [Group.Now], a SubscribeFunc function, a Source or a stop func, fails the
-//     call it ran in and nothing more: the Group is not left locked, and
-//     nobody is left waiting on a key. The key's upstream may go on running
-//     until its next subscriber leaves it or the Group is closed.
+//     call it ran in: the Group is not left locked, and nobody is left waiting
+//     on a key, though the key's upstream may go on running until its next
+//     subscriber leaves it or the Group is closed. On a goroutine the package
+//     starts there is no call to fail, and a panic crashes the program as on
+//     any goroutine: the timer that stops a key once its Linger runs out,
+//     which calls the stop func and the Stopped hook, and the one [Run] and
+//     [Poll] call their function on, with whatever its Emit calls.
 package streamflight

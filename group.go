@@ -63,8 +63,9 @@ type Group[K comparable, T any] struct {
 	// it for events: a replayed event is an old event delivered as a new one.
 	//
 	// A channel subscriber whose queue is shorter than what is replayed keeps
-	// the newest; see [Overflow]. A subscriber from SubscribeLatest is sent
-	// nothing: it reads what the key keeps instead.
+	// the newest, or under Evict is ended with ErrEvicted; see [Overflow]. A
+	// subscriber from SubscribeLatest is sent nothing: it reads what the key
+	// keeps instead.
 	//
 	// Set ReplayFor instead when the answer depends on the key.
 	Replay int
@@ -77,7 +78,8 @@ type Group[K comparable, T any] struct {
 	// It is called once per upstream, as the key is opened, with no Group lock
 	// held and possibly at the same time as another key's. What it returns is
 	// that upstream's for as long as the upstream lives, lingering included.
-	// Like a Source, it may use the Group but not subscribe to its own key.
+	// Like a Source, it may use the Group, but must not subscribe to its own
+	// key or close the Group.
 	ReplayFor func(key K) int
 
 	// Initial, if set, is called for each subscriber that joins a key, after
@@ -112,7 +114,8 @@ type Group[K comparable, T any] struct {
 	// testing/synctest there is no need to: time.Now is already the bubble's
 	// clock, and time.Sleep ages a value. It is called under the key's lock
 	// while the key's values are being published, so keep it short and do not
-	// call back into the Group. A key nobody samples never calls it.
+	// call back into the Group. A key calls it only once a sampler has joined
+	// it, and then for each value until its upstream stops.
 	Now func() time.Time
 
 	mu        sync.Mutex
@@ -124,8 +127,15 @@ type Group[K comparable, T any] struct {
 // Group, and all of them may be called concurrently for different keys. Joined
 // and Left run under a lock shared by the whole Group, so their counts arrive
 // in order; keep them short. Dropped runs under the key's lock, inside the
-// delivery that dropped the value. A hook that panics fails the call that
-// reported it, and nothing more.
+// delivery that dropped the value.
+//
+// A hook that panics fails the call that reported it: the Group is not left
+// locked and nobody is left waiting on a key, but a key whose Opened, Joined
+// or Left panicked may go on running until its next subscriber leaves it or
+// the Group is closed. A Stopped hook called when a key's Linger runs out, and
+// a Dropped hook reached from a [Run] or [Poll] function, run on a goroutine
+// the package started, where there is no call to fail and a panic crashes the
+// program.
 type Hooks[K comparable, T any] struct {
 	// Opened is called after the Source of key was called, with its error.
 	Opened func(key K, err error)
@@ -145,7 +155,9 @@ type Hooks[K comparable, T any] struct {
 	// Dropped is called with each value a subscriber of key loses to a full
 	// queue: under DropNewest the arriving value, which Emit did not count;
 	// under DropOldest the queued value it displaced, which an earlier Emit did
-	// count unless it was sent on joining, by Replay or Initial.
+	// count. What Replay and Initial send a joining subscriber is the
+	// exception: under any policy but Evict, a queue too short for it displaces
+	// its oldest, as DropOldest does, and no Emit counted those.
 	Dropped func(key K, v T)
 }
 
@@ -194,7 +206,8 @@ func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error)
 //
 // It costs the key one stored value however many subscribers sample it, and
 // costs a subscriber no more per value than a step through a loop. A key
-// nobody samples stores nothing.
+// stores nothing until a sampler joins it, and from then on keeps its newest
+// value until its upstream stops.
 //
 // A key a sampler opens keeps what its Source emits while opening, such as the
 // current state it read on subscribing. The first sampler of a key someone

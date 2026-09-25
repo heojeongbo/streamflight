@@ -149,9 +149,11 @@ func (s *Subscription[T]) Dropped() uint64 {
 // the answer depends on the key — silence on a topic published only when it
 // changes means nothing changed, and on a sensor means the sensor is gone.
 //
-// Once the subscription has ended, Latest goes on returning the last value it
-// had; Done or Err says whether it is still live. It never sees the fresh
-// upstream that the key's next subscriber opens.
+// Once the subscription has ended, Latest goes on reading the upstream it was
+// on: its newer values for as long as other subscribers keep it running, and
+// its last value once it has stopped. Done or Err says whether this
+// subscription is still live. It never sees the fresh upstream that the key's
+// next subscriber opens.
 func (s *Subscription[T]) Latest() (v T, at time.Time, ok bool) {
 	if s.fn != nil || s.ch != nil {
 		panic("streamflight: Latest on a subscription that is delivered to")
@@ -160,8 +162,9 @@ func (s *Subscription[T]) Latest() (v T, at time.Time, ok bool) {
 }
 
 // Wait blocks until the key has a value that arrived after the given time, and
-// returns it. ok is false if ctx ends first or the subscription does. A zero
-// time waits for the first value of all.
+// returns the newest there is. ok is false if ctx ends first, or if the
+// subscription has ended with no such value. A zero time returns the current
+// value, or waits for the first if there is none yet.
 //
 // It is for reading back what you just wrote, where the value that is there is
 // the one the write has not reached yet. The time is an arrival time on the
@@ -174,12 +177,14 @@ func (s *Subscription[T]) Latest() (v T, at time.Time, ok bool) {
 // Where seen is taken decides what counts. On a key published only when it
 // changes, take it before the write, as here: the change can arrive before the
 // write returns, and a time taken after it would wait past the change. On a
-// key published periodically, take it after the write returns, so that a value
-// sampled before the write does not count. Either way a newer value is only
-// newer. When the write shows in the value itself, wait until it does, passing
-// each value's arrival time to the next Wait: every call returns a value newer
-// than the last, and the newest there is, so a loop never sees one twice and
-// never falls behind, though it may skip values that were already replaced.
+// key published periodically, take it after the write returns, so that what
+// arrived before the write returned does not count. Either way, a value newer
+// than seen need not show the write: one sampled before the write can still
+// arrive after it. When the write shows in the value itself, wait until it
+// does, passing each value's arrival time to the next Wait: every call returns
+// a value newer than the last, and the newest there is, so a loop never sees
+// one twice and never falls behind, though it may skip values that were
+// already replaced.
 //
 // Like [Subscription.Latest] it is valid only on a subscription from
 // [Group.SubscribeLatest], and waits on nothing a delivery can hold.

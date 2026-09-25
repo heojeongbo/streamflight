@@ -43,7 +43,7 @@ Then subscribe. Which way depends on what is done with each value:
 
 | Each value is | Subscribe with | Because |
 |---|---|---|
-| sent somewhere that can block, such as a client | `Subscribe` and `Drain` | each subscriber has its own queue, so a slow one holds up nobody else |
+| sent somewhere that can block, such as a client | `Subscribe` and `Drain` | each subscriber has its own queue, so a slow one holds up nobody else unless its `Overflow` is `Block` |
 | handled by short work that never blocks | `SubscribeFunc` | it is called on the emitting goroutine, with nothing queued |
 | read as the current value, on the reader's own clock | `SubscribeLatest` and `Latest` | the key keeps its newest value once, and reading it consumes nothing |
 
@@ -86,7 +86,7 @@ for b := range sub.C {
 	render(b)
 }
 if err := sub.Err(); !errors.Is(err, io.EOF) {
-	return err // ErrEvicted, ErrGroupClosed, or the upstream's own error
+	return err // ErrClosed, ErrEvicted, ErrGroupClosed, or the upstream's own error
 }
 return nil // the upstream ended by itself
 ```
@@ -114,7 +114,10 @@ consumes: a reader that looks while the upstream is quiet finds an empty queue
 rather than the value that is still true.
 
 ```go
-sub, err := g.SubscribeLatest(struct{}{}) // one thermostat, so one key
+thermostat := &streamflight.Group[struct{}, float64]{Source: readSetpoint} // one thermostat, so one key
+defer thermostat.Close()
+
+sub, err := thermostat.SubscribeLatest(struct{}{})
 if err != nil {
 	return err
 }
@@ -129,15 +132,17 @@ is the one the write has not reached yet:
 ```go
 _, seen, _ := sub.Latest()
 setSetpoint(22)                 // the write
-v, _, ok := sub.Wait(ctx, seen) // the first value after seen, not the one before
+v, _, ok := sub.Wait(ctx, seen) // the newest value, once one has arrived after seen
 ```
 
 Take `seen` from `Latest` rather than from `time.Now`: it is an arrival time
 on the clock of `Group.Now`. On a key published only when it changes, take it
 before the write, as here, since the change can arrive before the write
-returns. On a key published periodically, take it after, so that a value
-sampled before the write does not count. When the write shows in the value
-itself, wait until it does: `ExampleSubscription_Wait` has the loop.
+returns. On a key published periodically, take it after, so that what arrived
+before the write returned does not count. Either way, a newer value need not
+show the write, since one sampled before it can still arrive after it: when
+the write shows in the value itself, wait until it does.
+`ExampleSubscription_Wait` has the loop.
 
 ### Writing a Source
 
@@ -210,8 +215,8 @@ wanting 0 can share one Group. `Group.Initial` sends it anything else first,
 such as a snapshot for a stream of deltas. Neither waits for a subscriber still
 inside `Subscribe`: a queue too short for what it is sent keeps the newest,
 except under `Evict`, which ends the subscription with `ErrEvicted` rather than
-let it start from a snapshot with a gap in it. A sampler is sent neither; it
-reads what the key keeps.
+let it start from a snapshot with a gap in it. A sampler keeps neither:
+`Initial` is still called for it, but it reads what the key keeps.
 
 **Churn.** `Group.Linger` keeps an upstream running for a while after its last
 subscriber leaves, so a reloaded page reuses it instead of opening it again.
@@ -238,21 +243,26 @@ it, such as a socket or a device, is a `Group[struct{}, T]` subscribed to with
 - **Stored before delivered.** Once a key has a sampler, a value emitted to it
   becomes its newest before it is delivered to anyone, so a `SubscribeFunc`
   function woken by a value reads that same value from `Latest`. That is what
-  lets one subscription carry the state and another the edge.
+  lets one subscription carry the state and another the edge. It holds for
+  values delivered as they are emitted, not for what `Replay` sends a
+  subscriber as it joins, which `Latest` may already have moved past.
 - **Nothing after Close.** Once `Close` returns, its subscriber is never
   delivered to again. A delivery in progress completes first.
 - **Nothing after the end.** Values emitted after the upstream is stopped or has
   ended are dropped.
-- **Keys are independent.** Opening or stopping one key never waits for
-  another, and neither does a subscriber that has fallen behind.
+- **Keys are independent.** Outside `Group.Close`, which stops keys one at a
+  time, opening or stopping one key never waits for another, and neither does
+  a subscriber that has fallen behind.
 
 ## Rules
 
 - Every subscriber receives the **same** value. Treat it as read-only.
 - A `SubscribeFunc` function, `Initial`, `Now` and the `Dropped` hook run under
-  the key's lock, as a delivery. They may read `Latest`, `Err` and `Dropped`.
-  They must not subscribe, `Close` a subscription, `Wait`, `Emit` or `End` on
-  the same key, or close the Group: each would wait on the lock they hold.
+  the key's lock, as a delivery. They may read `Latest`, `Err` and `Dropped`,
+  and `Emit` on another key to feed a stream derived from this one. They must
+  not subscribe or `Close` a subscription on any key, since either can run a
+  `Source` or `stop` that needs this key, nor `Wait`, `Emit` or `End` on the
+  same key, or close the Group: each would wait on the lock they hold.
 - A `Source`, its `stop`, `ReplayFor` and any goroutine they own **may** use
   the Group: they can subscribe to other keys and close any subscription, which
   is what a stream derived from another one needs. They must not subscribe to
@@ -260,9 +270,12 @@ it, such as a socket or a device, is a `Group[struct{}, T]` subscribed to with
   opening until its `stop` has returned, so either call would wait for itself.
 - Hooks must not call back into the Group. `Joined` and `Left` run under a lock
   shared by the whole Group, so keep them short.
-- A panic in your code fails the call it ran in and nothing more. The Group is
-  not left locked and nobody is left waiting on a key, though that key's
-  upstream may run until its next subscriber leaves or the Group is closed.
+- A panic in your code fails the call it ran in. The Group is not left locked
+  and nobody is left waiting on a key, though that key's upstream may run until
+  its next subscriber leaves or the Group is closed. On a goroutine the package
+  starts — the timer that stops a key once its `Linger` runs out, which calls
+  `stop` and `Stopped`, or the one `Run` and `Poll` call their function on —
+  there is no call of yours to fail, and a panic crashes the program.
 - Always `Close` a subscription, even one that has already ended.
 
 ## Performance

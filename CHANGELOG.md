@@ -30,10 +30,12 @@ to the exported surface is eight new names.
   | 100 | 14.7 µs | 182 ns |
 
   `Subscription.Wait(ctx, t)` blocks until a value newer than `t` arrives, for
-  reading back what you just wrote: note the time, issue the write, wait past
-  it rather than sampling the value the write has not reached yet. Arrival
-  times are strictly increasing within a key, so two values a caller can tell
-  apart always have times it can tell apart, whatever the clock's resolution.
+  reading back what you just wrote: take an arrival time from `Latest` rather
+  than `time.Now`, issue the write, and wait past it rather than sampling the
+  value the write has not reached yet (`Wait` says whether to take the time
+  before or after the write). Arrival times are strictly increasing within a
+  key, so two values a caller can tell apart always have times it can tell
+  apart, whatever the clock's resolution.
 
   A key nobody samples is unaffected: `Emit` stays at 5.4 ns and allocates
   nothing. There is no value until the first one emitted after the first
