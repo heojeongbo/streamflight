@@ -3,6 +3,7 @@ package streamflight_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/heojeongbo/streamflight"
@@ -97,7 +98,7 @@ func ExampleRun() {
 // a closure.
 func ExampleSubscription_Drain() {
 	g := &streamflight.Group[string, string]{
-		Replay: 1, // Poll's first tick runs before the opener is attached
+		Replay: 1, // Poll's first tick can run before the opener is attached
 		Source: streamflight.Poll(time.Hour,
 			func(_ context.Context, key string, e streamflight.Emitter[string]) error {
 				e.Emit("status of " + key)
@@ -106,7 +107,7 @@ func ExampleSubscription_Drain() {
 	}
 	defer g.Close()
 
-	sub, err := g.Subscribe("robot-1", streamflight.WithBuffer(8))
+	sub, err := g.Subscribe("db1", streamflight.WithBuffer(8))
 	if err != nil {
 		return
 	}
@@ -122,6 +123,116 @@ func ExampleSubscription_Drain() {
 	}))
 
 	// Output:
-	// status of robot-1
+	// status of db1
 	// <nil>
+}
+
+// A thermostat's setpoint, read whenever the reader looks and read back after
+// a write. One upstream shared by whoever wants it is a Group with one key.
+func ExampleGroup_SubscribeLatest() {
+	var device streamflight.Emitter[float64]
+	g := &streamflight.Group[struct{}, float64]{
+		Source: func(_ struct{}, e streamflight.Emitter[float64]) (func() error, error) {
+			device = e
+			e.Emit(21.5) // the current setpoint, read on subscribing
+			return nil, nil
+		},
+	}
+	defer g.Close()
+
+	s, err := g.SubscribeLatest(struct{}{})
+	if err != nil {
+		return
+	}
+	defer s.Close()
+
+	v, seen, _ := s.Latest() // as often as it likes: nothing is consumed
+	fmt.Println("now:", v)
+
+	device.Emit(22) // the write, reported back by the device
+	v, _, _ = s.Wait(context.Background(), seen)
+	fmt.Println("after:", v)
+
+	// Output:
+	// now: 21.5
+	// after: 22
+}
+
+// Reading back a write that shows in the value itself. A report that was
+// already on its way can still carry the old value, so wait for newer values
+// until one has the new one.
+func ExampleSubscription_Wait() {
+	var device streamflight.Emitter[int]
+	g := &streamflight.Group[string, int]{
+		Source: func(_ string, e streamflight.Emitter[int]) (func() error, error) {
+			device = e
+			e.Emit(20)
+			return nil, nil
+		},
+	}
+	defer g.Close()
+
+	s, err := g.SubscribeLatest("thermostat")
+	if err != nil {
+		return
+	}
+	defer s.Close()
+
+	_, at, _ := s.Latest()
+	set := func(want int) {
+		go func() {
+			device.Emit(20) // the report that was already on its way
+			device.Emit(want)
+		}()
+	}
+	set(22)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	v, ok := 0, false
+	for {
+		if v, at, ok = s.Wait(ctx, at); !ok || v == 22 {
+			break
+		}
+	}
+	fmt.Println(v, ok)
+
+	// Output:
+	// 22 true
+}
+
+// Setup a Source does per key, before the poll starts: here the interval comes
+// from the key. A key the setup rejects fails Subscribe, rather than opening a
+// stream that ends at once.
+func ExamplePoll() {
+	g := &streamflight.Group[string, string]{
+		Replay: 1, // the first tick can run before the opener is attached
+		Source: func(key string, e streamflight.Emitter[string]) (func() error, error) {
+			host, every, _ := strings.Cut(key, "@")
+			interval, err := time.ParseDuration(every)
+			if err != nil {
+				return nil, fmt.Errorf("bad key %q", key)
+			}
+			return streamflight.Poll(interval,
+				func(_ context.Context, _ string, e streamflight.Emitter[string]) error {
+					e.Emit("status of " + host)
+					return nil
+				})(key, e)
+		},
+	}
+	defer g.Close()
+
+	_, err := g.Subscribe("db1@often")
+	fmt.Println(err)
+
+	s, err := g.Subscribe("db1@1h")
+	if err != nil {
+		return
+	}
+	defer s.Close()
+	fmt.Println(<-s.C)
+
+	// Output:
+	// bad key "db1@often"
+	// status of db1
 }

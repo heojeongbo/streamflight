@@ -39,65 +39,17 @@ g := &streamflight.Group[string, []byte]{
 defer g.Close()
 ```
 
-Then subscribe, with a function called for each value:
+Then subscribe. Which way depends on what is done with each value:
 
-```go
-sub, err := g.SubscribeFunc("prices/BTC", func(b []byte) { conn.Send(b) })
-if err != nil {
-	return err
-}
-defer sub.Close() // the last Close stops the upstream
-```
+| Each value is | Subscribe with | Because |
+|---|---|---|
+| sent somewhere that can block, such as a client | `Subscribe` and `Drain` | each subscriber has its own queue, so a slow one holds up nobody else |
+| handled by short work that never blocks | `SubscribeFunc` | it is called on the emitting goroutine, with nothing queued |
+| read as the current value, on the reader's own clock | `SubscribeLatest` and `Latest` | the key keeps its newest value once, and reading it consumes nothing |
 
-or with a channel:
+### Relaying to a client
 
-```go
-sub, err := g.Subscribe("prices/BTC", streamflight.WithBuffer(16))
-if err != nil {
-	return err
-}
-defer sub.Close()
-
-for b := range sub.C {
-	render(b)
-}
-return sub.Err() // why it ended: io.EOF, the upstream's error, ErrEvicted, ...
-```
-
-A Source whose upstream is a repeated request rather than a subscription is
-written with `Poll`:
-
-```go
-Replay: 1, // the first tick runs before the opening subscriber is attached
-Source: streamflight.Poll(3*time.Second,
-	func(ctx context.Context, host string, e streamflight.Emitter[Status]) error {
-		e.Emit(poll(ctx, host))
-		return nil
-	}),
-```
-
-The first call is on open, so a subscriber sees something immediately, and the
-next is an interval after the last one *returned* — not a `time.Ticker`, which
-keeps the tick a slow call missed and fires again at once, leaving a poll that
-outruns its interval running back to back with no idle at all.
-
-A Source that runs its own loop is written with `Run` instead:
-
-```go
-Source: streamflight.Run(func(ctx context.Context, host string, e streamflight.Emitter[Status]) error {
-	for {
-		v, err := conn.Read(ctx) // whatever blocks until the next value
-		if err != nil {
-			return err // the upstream ends; subscribers see this error
-		}
-		e.Emit(v)
-	}
-}),
-```
-
-## Relaying to a client
-
-A handler that relays one key to one client is `Drain`:
+A handler that relays one key to one client is `Subscribe` and `Drain`:
 
 ```go
 func (s *Server) Watch(req *Request, stream grpc.ServerStreamingServer[Status]) error {
@@ -105,7 +57,7 @@ func (s *Server) Watch(req *Request, stream grpc.ServerStreamingServer[Status]) 
 	if err != nil {
 		return err
 	}
-	defer sub.Close()
+	defer sub.Close() // the last Close stops the upstream
 	return sub.Drain(stream.Context(), stream.Send)
 }
 ```
@@ -126,42 +78,140 @@ the key waits for it, and this subscription's `Overflow` policy decides what
 falling behind costs. That is why a network write belongs here and not in
 `SubscribeFunc`.
 
-## Choosing the behaviour
-
-**Delivery.** Three shapes, for three kinds of consumer:
-
-| | | For |
-|---|---|---|
-| `SubscribeFunc` | calls a function on the emitting goroutine | every value matters and the work is short |
-| `Subscribe` | queues on a channel | every value matters and the work can block |
-| `SubscribeLatest` | keeps only the newest, read with `Latest()` | only the current value matters |
-
-`SubscribeLatest` also has `Wait`, for reading back what you just wrote:
+The channel is also there to read directly. It is closed when the subscription
+ends, and `Err` says why:
 
 ```go
-sub, err := g.SubscribeLatest(robot)
-...
-at := time.Now()
-setMode(robot, mode)                       // the write
-v, _, ok := sub.Wait(ctx, at)              // not the value the write has not reached yet
+for b := range sub.C {
+	render(b)
+}
+if err := sub.Err(); !errors.Is(err, io.EOF) {
+	return err // ErrEvicted, ErrGroupClosed, or the upstream's own error
+}
+return nil // the upstream ended by itself
 ```
 
-`SubscribeFunc` queues nothing, but a slow function holds up every other
-subscriber of the key. `Subscribe` queues instead, and its `Overflow` policy
-decides what happens to a subscriber that falls behind:
+### Short work
+
+Work that is short and never blocks is `SubscribeFunc`, which queues nothing:
+
+```go
+sub, err := g.SubscribeFunc("prices/BTC", func(b []byte) {
+	bytesIn.Add(int64(len(b))) // every other subscriber of the key waits for this
+})
+if err != nil {
+	return err
+}
+defer sub.Close()
+```
+
+### Reading the current value
+
+A reader on its own clock — a handler on an interval, a frame loop, a health
+check — wants the value that is true when it looks, not every value as it
+arrives. That is `SubscribeLatest`. A channel cannot do it, because receiving
+consumes: a reader that looks while the upstream is quiet finds an empty queue
+rather than the value that is still true.
+
+```go
+sub, err := g.SubscribeLatest(struct{}{}) // one thermostat, so one key
+if err != nil {
+	return err
+}
+defer sub.Close()
+
+v, at, ok := sub.Latest() // as often as you like; whether at is too old is yours to decide
+```
+
+`Wait` is for reading back what you just wrote, where the value that is there
+is the one the write has not reached yet:
+
+```go
+_, seen, _ := sub.Latest()
+setSetpoint(22)                 // the write
+v, _, ok := sub.Wait(ctx, seen) // the first value after seen, not the one before
+```
+
+Take `seen` from `Latest` rather than from `time.Now`: it is an arrival time
+on the clock of `Group.Now`. On a key published only when it changes, take it
+before the write, as here, since the change can arrive before the write
+returns. On a key published periodically, take it after, so that a value
+sampled before the write does not count. When the write shows in the value
+itself, wait until it does: `ExampleSubscription_Wait` has the loop.
+
+### Writing a Source
+
+A Source whose upstream is a repeated request rather than a subscription is
+written with `Poll`:
+
+```go
+Replay: 1, // the first tick can run before the opening subscriber is attached
+Source: streamflight.Poll(3*time.Second,
+	func(ctx context.Context, host string, e streamflight.Emitter[Status]) error {
+		e.Emit(poll(ctx, host))
+		return nil
+	}),
+```
+
+The first call is on open, so a subscriber sees something immediately, and the
+next is an interval after the last one *returned* — not a `time.Ticker`, which
+keeps the tick a slow call missed and fires again at once, leaving a poll that
+outruns its interval running back to back with no idle at all. A subscriber
+from `SubscribeLatest` that opens the key needs no `Replay`: a key it opens
+keeps what its Source emits while opening.
+
+A Source that runs its own loop is written with `Run`. Setup that can fail goes
+before it, in the Source, so that it fails `Subscribe` instead of ending a
+stream that has just been handed out:
+
+```go
+Source: func(host string, e streamflight.Emitter[Status]) (func() error, error) {
+	conn, err := dial(host)
+	if err != nil {
+		return nil, err // Subscribe fails with it
+	}
+	return streamflight.Run(func(ctx context.Context, host string, e streamflight.Emitter[Status]) error {
+		context.AfterFunc(ctx, func() { conn.Close() }) // unblocks Read once the key stops
+		for {
+			v, err := conn.Read()
+			if err != nil {
+				return err // the upstream ends; subscribers see this error
+			}
+			e.Emit(v)
+		}
+	})(host, e)
+},
+```
+
+Stopping the key cancels `ctx` and waits for the loop to return, so a read that
+takes no context has to be unblocked some other way, as `AfterFunc` does here.
+The same shape gives `Poll` an interval that depends on the key.
+
+## Choosing the behaviour
+
+**Falling behind.** `SubscribeFunc` queues nothing, but a slow function holds
+up every other subscriber of the key. `Subscribe` queues instead, and its
+`Overflow` policy decides what happens to a subscriber that falls behind:
 
 | Policy | A full queue… | For |
 |---|---|---|
 | `DropOldest` (default) | discards its oldest value | state, where only the latest matters |
 | `DropNewest` | refuses the arriving value | keeping the start of a burst |
-| `Block` | waits for the subscriber, and so does everyone else | lossless delivery to consumers that keep up |
+| `Block` | waits for the subscriber, and so do the `Source` and every other subscriber of the key | lossless delivery to consumers that keep up |
 | `Evict` | closes the subscriber with `ErrEvicted` | deltas, where a gap corrupts everything after it |
+
+With no options the queue holds one value and drops its oldest, which suits
+state and not events.
 
 **Late subscribers.** `Group.Replay` sends a joining subscriber the latest
 values, for state that is only published when it changes — or `Group.ReplayFor`
 when only some keys are state, so that a topic wanting 1 and an event stream
 wanting 0 can share one Group. `Group.Initial` sends it anything else first,
-such as a snapshot for a stream of deltas.
+such as a snapshot for a stream of deltas. Neither waits for a subscriber still
+inside `Subscribe`: a queue too short for what it is sent keeps the newest,
+except under `Evict`, which ends the subscription with `ErrEvicted` rather than
+let it start from a snapshot with a gap in it. A sampler is sent neither; it
+reads what the key keeps.
 
 **Churn.** `Group.Linger` keeps an upstream running for a while after its last
 subscriber leaves, so a reloaded page reuses it instead of opening it again.
@@ -169,6 +219,10 @@ subscriber leaves, so a reloaded page reuses it instead of opening it again.
 **Upstreams that end.** A Source calls `Emitter.End` when its upstream ends by
 itself. Every subscriber is closed with that error, and the next subscriber
 opens a fresh upstream.
+
+**One key.** A Group need not have many. One upstream shared by whoever wants
+it, such as a socket or a device, is a `Group[struct{}, T]` subscribed to with
+`struct{}{}`: the first subscriber opens it and the last one to leave stops it.
 
 **Observability.** `Group.Hooks` reports opens, stops, joins, leaves and drops.
 
@@ -181,21 +235,34 @@ opens a fresh upstream.
 - **In order, one at a time.** Values reach every subscriber in the order they
   were emitted, and a subscriber is never delivered to concurrently, even when
   the Source emits from several goroutines.
+- **Stored before delivered.** Once a key has a sampler, a value emitted to it
+  becomes its newest before it is delivered to anyone, so a `SubscribeFunc`
+  function woken by a value reads that same value from `Latest`. That is what
+  lets one subscription carry the state and another the edge.
 - **Nothing after Close.** Once `Close` returns, its subscriber is never
-  delivered to again.
-- **Keys are independent.** Opening or stopping one key never blocks another,
-  and neither does a subscriber that has fallen behind.
+  delivered to again. A delivery in progress completes first.
+- **Nothing after the end.** Values emitted after the upstream is stopped or has
+  ended are dropped.
+- **Keys are independent.** Opening or stopping one key never waits for
+  another, and neither does a subscriber that has fallen behind.
 
 ## Rules
 
 - Every subscriber receives the **same** value. Treat it as read-only.
-- Delivery functions, `Initial` and `Hooks` must not call back into the Group,
-  and a `SubscribeFunc` function must not close its own subscription.
-- A `Source`, its `stop` and any goroutine they own **may** use the Group: they
-  can subscribe to other keys and close any subscription, which is what a
-  stream derived from another one needs. They must not subscribe to their own
-  key or close the Group — a key is held from the moment it starts opening
-  until its `stop` has returned, so either call would wait for itself.
+- A `SubscribeFunc` function, `Initial`, `Now` and the `Dropped` hook run under
+  the key's lock, as a delivery. They may read `Latest`, `Err` and `Dropped`.
+  They must not subscribe, `Close` a subscription, `Wait`, `Emit` or `End` on
+  the same key, or close the Group: each would wait on the lock they hold.
+- A `Source`, its `stop`, `ReplayFor` and any goroutine they own **may** use
+  the Group: they can subscribe to other keys and close any subscription, which
+  is what a stream derived from another one needs. They must not subscribe to
+  their own key or close the Group — a key is held from the moment it starts
+  opening until its `stop` has returned, so either call would wait for itself.
+- Hooks must not call back into the Group. `Joined` and `Left` run under a lock
+  shared by the whole Group, so keep them short.
+- A panic in your code fails the call it ran in and nothing more. The Group is
+  not left locked and nobody is left waiting on a key, though that key's
+  upstream may run until its next subscriber leaves or the Group is closed.
 - Always `Close` a subscription, even one that has already ended.
 
 ## Performance

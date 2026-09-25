@@ -62,6 +62,10 @@ type Group[K comparable, T any] struct {
 	// subscriber would otherwise see nothing until the next change. Do not use
 	// it for events: a replayed event is an old event delivered as a new one.
 	//
+	// A channel subscriber whose queue is shorter than what is replayed keeps
+	// the newest; see [Overflow]. A subscriber from SubscribeLatest is sent
+	// nothing: it reads what the key keeps instead.
+	//
 	// Set ReplayFor instead when the answer depends on the key.
 	Replay int
 
@@ -72,8 +76,8 @@ type Group[K comparable, T any] struct {
 	//
 	// It is called once per upstream, as the key is opened, with no Group lock
 	// held and possibly at the same time as another key's. What it returns is
-	// that upstream's for as long as the upstream lives, lingering included. It
-	// must not call back into the Group.
+	// that upstream's for as long as the upstream lives, lingering included.
+	// Like a Source, it may use the Group but not subscribe to its own key.
 	ReplayFor func(key K) int
 
 	// Initial, if set, is called for each subscriber that joins a key, after
@@ -84,6 +88,11 @@ type Group[K comparable, T any] struct {
 	//
 	// No value is emitted during the call, but a value emitted right after it
 	// may already be reflected in the snapshot, so deltas should be idempotent.
+	//
+	// It runs under the key's lock, like a delivery. What it sends to a channel
+	// subscriber whose queue is too short follows the rule in [Overflow]: under
+	// Evict the subscription ends with ErrEvicted rather than start from a
+	// snapshot with a gap in it. What it sends a sampler is not kept.
 	Initial func(key K, send func(T))
 
 	// Linger keeps an upstream running this long after its last subscriber
@@ -99,7 +108,9 @@ type Group[K comparable, T any] struct {
 	// Defaults to time.Now.
 	//
 	// Set it to age a value from a test: whether a value is still current is
-	// the caller's to decide, and deciding it is worth a test. It is called
+	// the caller's to decide, and deciding it is worth a test. Under
+	// testing/synctest there is no need to: time.Now is already the bubble's
+	// clock, and time.Sleep ages a value. It is called under the key's lock
 	// while the key's values are being published, so keep it short and do not
 	// call back into the Group. A key nobody samples never calls it.
 	Now func() time.Time
@@ -112,7 +123,9 @@ type Group[K comparable, T any] struct {
 // Hooks observe a Group. Every field is optional. None may call back into the
 // Group, and all of them may be called concurrently for different keys. Joined
 // and Left run under a lock shared by the whole Group, so their counts arrive
-// in order; keep them short.
+// in order; keep them short. Dropped runs under the key's lock, inside the
+// delivery that dropped the value. A hook that panics fails the call that
+// reported it, and nothing more.
 type Hooks[K comparable, T any] struct {
 	// Opened is called after the Source of key was called, with its error.
 	Opened func(key K, err error)
@@ -122,20 +135,27 @@ type Hooks[K comparable, T any] struct {
 	Stopped func(key K, err error)
 
 	// Joined is called when a subscriber joins key, with how many it has now.
+	// It is called before the subscriber is sent what Replay and Initial have
+	// for it, so it is not a sign that the subscriber can receive yet.
 	Joined func(key K, n int)
 
 	// Left is called when a subscriber of key closes, with how many remain.
 	Left func(key K, n int)
 
-	// Dropped is called with each value a subscriber of key loses to its
-	// Overflow policy: under DropNewest the arriving value, which Emit did not
-	// count; under DropOldest the queued value it displaced, which an earlier
-	// Emit did count.
+	// Dropped is called with each value a subscriber of key loses to a full
+	// queue: under DropNewest the arriving value, which Emit did not count;
+	// under DropOldest the queued value it displaced, which an earlier Emit did
+	// count unless it was sent on joining, by Replay or Initial.
 	Dropped func(key K, v T)
 }
 
 // Subscribe joins key, opening its upstream if it has no subscriber, and
 // queues its values on the subscription's channel C.
+//
+// With no options the queue holds one value and a full queue drops its oldest
+// ([DropOldest]): right for state, where only the latest matters, and wrong for
+// events, which want [WithBuffer] and perhaps another [Overflow]. Relaying the
+// values to a client is [Subscription.Drain].
 func (g *Group[K, T]) Subscribe(key K, opts ...SubscribeOption) (*Subscription[T], error) {
 	c := subscribeConfig{buffer: 1}
 	for _, opt := range opts {
@@ -150,8 +170,10 @@ func (g *Group[K, T]) Subscribe(key K, opts ...SubscribeOption) (*Subscription[T
 }
 
 // SubscribeFunc joins key, opening its upstream if it has no subscriber, and
-// calls fn with each of its values on the goroutine that emitted it. fn must
-// not block; see the package documentation.
+// calls fn with each of its values on the goroutine that emitted it. What
+// Replay and Initial have for it is delivered first, on the calling goroutine,
+// before SubscribeFunc returns: a fn that refers to the returned subscription
+// finds it nil for those. fn must not block; see the package documentation.
 func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error) {
 	s := newSubscription[T](fn, nil, 0)
 	if err := g.subscribe(key, s); err != nil {
@@ -171,7 +193,13 @@ func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error)
 // upstream is quiet finds an empty queue, not the value that is still true.
 //
 // It costs the key one stored value however many subscribers sample it, and
-// costs a subscriber nothing per value. A key nobody samples stores nothing.
+// costs a subscriber no more per value than a step through a loop. A key
+// nobody samples stores nothing.
+//
+// A key a sampler opens keeps what its Source emits while opening, such as the
+// current state it read on subscribing. The first sampler of a key someone
+// else opened starts with nothing until the next value: Replay keeps no
+// arrival times, so it cannot seed one.
 func (g *Group[K, T]) SubscribeLatest(key K) (*Subscription[T], error) {
 	s := newSubscription[T](nil, nil, 0)
 	if err := g.subscribe(key, s); err != nil {

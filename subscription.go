@@ -11,6 +11,12 @@ import (
 
 // Overflow is what a channel subscriber's queue does with a value that arrives
 // while it is full.
+//
+// What Replay and Initial send a subscriber as it joins is never waited for,
+// since the subscriber is still inside Subscribe and cannot read yet. A queue
+// too short for it keeps the newest, whatever the policy, and counts what it
+// displaced in Dropped, except under Evict, which ends the subscription with
+// ErrEvicted instead: Subscribe then returns it already ended.
 type Overflow int
 
 const (
@@ -22,13 +28,16 @@ const (
 	// DropNewest discards the arriving value, so the queue keeps the oldest.
 	DropNewest
 
-	// Block waits until the subscriber makes room. Nothing is lost, but every
-	// other subscriber of the key, and the Source itself, waits too. Closing
-	// the subscription, ending the upstream or closing the Group releases it.
+	// Block waits until the subscriber makes room. Nothing emitted while it is
+	// subscribed is lost, but every other subscriber of the key, and the Source
+	// itself, waits too. Closing the subscription, ending the upstream or
+	// closing the Group releases it, and the value it was waiting to deliver is
+	// not delivered.
 	Block
 
 	// Evict closes the subscriber with ErrEvicted. Right when a gap would make
-	// everything after it wrong, such as a stream of deltas.
+	// everything after it wrong, such as a stream of deltas, and so a gap in
+	// what it is sent on joining counts too.
 	Evict
 )
 
@@ -59,7 +68,8 @@ func WithOverflow(o Overflow) SubscribeOption {
 type Subscription[T any] struct {
 	// C receives the values of a subscription made by Subscribe. It is closed
 	// when the subscription ends, after which it still yields what was queued.
-	// It is nil for a subscription made by SubscribeFunc.
+	// It is nil for a subscription made by SubscribeFunc or SubscribeLatest,
+	// and receiving from it then blocks forever.
 	C <-chan T
 
 	fn       func(T)
@@ -118,7 +128,10 @@ func (s *Subscription[T]) Err() error {
 	}
 }
 
-// Dropped counts the values this subscriber lost to its Overflow policy.
+// Dropped counts the values this subscriber lost to a full queue: under
+// DropNewest those it refused, under DropOldest those it displaced, and, under
+// any policy but Evict, what Replay and Initial sent it on joining that did
+// not fit. See [Overflow].
 func (s *Subscription[T]) Dropped() uint64 {
 	return s.dropped.Load()
 }
@@ -130,10 +143,15 @@ func (s *Subscription[T]) Dropped() uint64 {
 //
 // There is nothing until the first value emitted after the first sampler of
 // the key joined, the same as any latch: a key remembers its newest value only
-// once somebody is watching for it. Whether a value is still current is the
-// caller's to decide from at, because the answer depends on the key — silence
-// on a topic published only when it changes means nothing changed, and on a
-// sensor means the sensor is gone.
+// once somebody is watching for it. A sampler that opened the key is watching
+// from the start, so it also has what the Source emitted while opening.
+// Whether a value is still current is the caller's to decide from at, because
+// the answer depends on the key — silence on a topic published only when it
+// changes means nothing changed, and on a sensor means the sensor is gone.
+//
+// Once the subscription has ended, Latest goes on returning the last value it
+// had; Done or Err says whether it is still live. It never sees the fresh
+// upstream that the key's next subscriber opens.
 func (s *Subscription[T]) Latest() (v T, at time.Time, ok bool) {
 	if s.fn != nil || s.ch != nil {
 		panic("streamflight: Latest on a subscription that is delivered to")
@@ -141,22 +159,36 @@ func (s *Subscription[T]) Latest() (v T, at time.Time, ok bool) {
 	return s.owner.latest()
 }
 
-// Wait blocks until the key has a value that arrived after t, and returns it.
-// ok is false if ctx ends first or the subscription does.
+// Wait blocks until the key has a value that arrived after the given time, and
+// returns it. ok is false if ctx ends first or the subscription does. A zero
+// time waits for the first value of all.
 //
-// It is for reading back what you just wrote, where the value you want is not
-// the one that is there: issue the write, note the time, and wait for a value
-// newer than that rather than sampling the one the write has not reached yet.
-// Pass a zero time to wait for the first value of all.
+// It is for reading back what you just wrote, where the value that is there is
+// the one the write has not reached yet. The time is an arrival time on the
+// clock of [Group.Now], so take it from Latest rather than from time.Now:
+//
+//	_, seen, _ := s.Latest()
+//	write()
+//	v, _, ok := s.Wait(ctx, seen)
+//
+// Where seen is taken decides what counts. On a key published only when it
+// changes, take it before the write, as here: the change can arrive before the
+// write returns, and a time taken after it would wait past the change. On a
+// key published periodically, take it after the write returns, so that a value
+// sampled before the write does not count. Either way a newer value is only
+// newer. When the write shows in the value itself, wait until it does, passing
+// each value's arrival time to the next Wait: every call returns a value newer
+// than the last, and the newest there is, so a loop never sees one twice and
+// never falls behind, though it may skip values that were already replaced.
 //
 // Like [Subscription.Latest] it is valid only on a subscription from
 // [Group.SubscribeLatest], and waits on nothing a delivery can hold.
-func (s *Subscription[T]) Wait(ctx context.Context, t time.Time) (v T, at time.Time, ok bool) {
+func (s *Subscription[T]) Wait(ctx context.Context, after time.Time) (v T, at time.Time, ok bool) {
 	if s.fn != nil || s.ch != nil {
 		panic("streamflight: Wait on a subscription that is delivered to")
 	}
 	for {
-		v, at, ok, newer := s.owner.latestAfter(t)
+		v, at, ok, newer := s.owner.latestAfter(after)
 		if ok {
 			return v, at, true
 		}
@@ -177,10 +209,10 @@ func (s *Subscription[T]) Wait(ctx context.Context, t time.Time) (v T, at time.T
 // It returns nil when ctx is done and nil when the upstream ended cleanly,
 // which are the two ordinary ways a relay finishes: the client went away, or
 // there is nothing left to send. Otherwise it returns the first error send
-// returned, or why the subscription ended: [ErrEvicted], [ErrGroupClosed], or
-// the error the upstream ended with. Values already queued when the upstream
-// ended are sent before that. Use [Subscription.Err] to tell a client that went
-// away from a clean end.
+// returned, or why the subscription ended: [ErrClosed] when another goroutine
+// closed it, [ErrEvicted], [ErrGroupClosed], or the error the upstream ended
+// with. Values already queued when the upstream ended are sent before that.
+// Use [Subscription.Err] to tell a client that went away from a clean end.
 //
 // send runs on the caller's goroutine, one value at a time, so it may block: no
 // other subscriber of the key waits for it, and this subscription's [Overflow]
@@ -216,7 +248,8 @@ func (s *Subscription[T]) Drain(ctx context.Context, send func(T) error) error {
 
 // Close ends the subscription and releases its hold on the upstream. The last
 // Close of a key stops the upstream, unless the Group lingers, and returns the
-// error of stop. Close is idempotent and returns the same error every time.
+// error of stop when this Close is what stopped it. Close is idempotent and
+// returns the same error every time.
 func (s *Subscription[T]) Close() error {
 	s.closeOnce.Do(func() {
 		if s.closing != nil {

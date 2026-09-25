@@ -18,7 +18,17 @@
 // then closed with the error it ended with, and the next subscriber opens a
 // fresh upstream.
 //
+// A Group need not have many keys. One upstream shared by whoever wants it,
+// opened by the first and stopped after the last, is a Group[struct{}, T]
+// subscribed to with struct{}{}: the reference count comes with it.
+//
 // # Delivery
+//
+// Which way to subscribe depends on what is done with each value. Sending it
+// somewhere that can block, such as a client connection, is [Group.Subscribe]
+// and [Subscription.Drain]. Short work that never blocks, such as counting or
+// updating a map, is [Group.SubscribeFunc]. Reading the current value on the
+// reader's own clock is [Group.SubscribeLatest].
 //
 // [Group.SubscribeFunc] calls a function for each value, on the goroutine that
 // emitted it. It costs nothing per value beyond the call, but a slow function
@@ -35,8 +45,8 @@
 // A channel cannot do that, because receiving consumes: a reader that looks
 // while the upstream is quiet finds an empty queue rather than the value that
 // is still true. The key stores it once however many subscribers sample it,
-// and [Subscription.Wait] blocks for one newer than a given time, which is how
-// a caller reads back what it has just written.
+// and [Subscription.Wait] blocks for one that arrived after a time Latest
+// returned, which is how a caller reads back what it has just written.
 //
 // [Subscription.Drain] is that channel pumped into a sink until a context ends,
 // which is what a handler relaying one key to one client does. A write that can
@@ -47,7 +57,9 @@
 //
 // A subscriber that joins a running upstream can first be sent what it missed:
 // the latest values ([Group.Replay], or [Group.ReplayFor] when it depends on
-// the key) or a snapshot of the current state ([Group.Initial]).
+// the key) or a snapshot of the current state ([Group.Initial]). A function
+// subscriber is sent them inside SubscribeFunc, on the calling goroutine,
+// before it returns. A sampler is sent neither: it reads what the key keeps.
 //
 // A [Source] is written from whatever the upstream is. [Run] makes one out of a
 // loop that produces values until its context is done; [Poll] out of a function
@@ -63,22 +75,28 @@
 //   - Values reach every subscriber of a key in the order they were emitted, and
 //     a subscriber is never delivered to concurrently, even when the Source
 //     emits from several goroutines.
-//   - A value becomes the key's newest before it is delivered to any subscriber.
-//     A subscriber woken by a value therefore reads that same value from
-//     [Subscription.Latest], never the one before it, which is what lets one
-//     subscription carry the state and another the edge.
+//   - Once a key has a sampler, a value emitted to it becomes its newest before
+//     it is delivered to any subscriber. A SubscribeFunc function woken by a
+//     value therefore reads that same value from [Subscription.Latest], never
+//     the one before it, which is what lets one subscription carry the state
+//     and another the edge. A channel reader, which reads later, reads it or a
+//     newer one.
 //   - After [Subscription.Close] returns, its subscriber is never delivered to
 //     again. A delivery in progress completes first.
 //   - Values emitted after the upstream is stopped or has ended are dropped.
+//   - Keys are independent: opening or stopping one key never waits for
+//     another, and neither does a subscriber that has fallen behind.
 //
 // # Rules
 //
 //   - Every subscriber of a key receives the same value. Treat it as read-only,
 //     and copy it before mutating.
-//   - Deliveries run on the emitting goroutine while holding the key's lock.
-//     A function passed to SubscribeFunc, [Group.Initial] and [Hooks] must not
-//     call back into the Group, and neither may Close be called from inside a
-//     SubscribeFunc function: both deadlock.
+//   - Deliveries run on the emitting goroutine while holding the key's lock,
+//     and so do [Group.Initial], [Group.Now] and the Dropped hook. From there it
+//     is safe to read [Subscription.Latest], Err and Dropped, which never wait.
+//     It is not safe to subscribe, to Close a subscription, to call
+//     [Subscription.Wait], to Emit or End on the same key, or to close the
+//     Group: each waits on the lock the delivery holds, and deadlocks.
 //   - Open and stop run with no Group lock held, and different keys open and
 //     stop at the same time. A [Source], [Group.ReplayFor], its stop func and
 //     any goroutine they own may use the Group: they may subscribe to other
@@ -91,9 +109,17 @@
 //   - Subscribe waits while another goroutine is opening or stopping the same
 //     key. It never waits for another key's Source or stop func.
 //   - The Joined and Left hooks run under a lock shared by the whole Group, so
-//     that their counts are reported in order. Keep them short. Opened,
-//     Stopped and Dropped run with no Group lock held, and every hook may run
-//     concurrently for different keys.
+//     that their counts are reported in order. Keep them short, and do not
+//     call back into the Group from any hook. Opened and Stopped run with no
+//     lock held, Dropped under the key's lock as a delivery does, and every
+//     hook may run concurrently for different keys.
 //   - Always Close a Subscription, including one that has already ended. An
-//     upstream is stopped only when all of its subscriptions are closed.
+//     upstream is stopped when all of its subscriptions are closed, when the
+//     Group is closed, or, once it has ended by itself, when the next
+//     subscriber of its key arrives to open a fresh one.
+//   - A panic in the caller's code, whether a hook, [Group.Initial],
+//     [Group.Now], a SubscribeFunc function, a Source or a stop func, fails the
+//     call it ran in and nothing more: the Group is not left locked, and
+//     nobody is left waiting on a key. The key's upstream may go on running
+//     until its next subscriber leaves it or the Group is closed.
 package streamflight
