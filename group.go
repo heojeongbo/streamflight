@@ -216,9 +216,7 @@ func (g *Group[K, T]) Close() error {
 		}
 		g.mu.Unlock()
 
-		for _, f := range doomed {
-			errs = append(errs, g.doStop(f, ErrGroupClosed))
-		}
+		errs = g.stopAll(doomed, errs)
 		if len(doomed) == 0 {
 			if w == nil {
 				return errors.Join(errs...)
@@ -226,6 +224,24 @@ func (g *Group[K, T]) Close() error {
 			<-w
 		}
 	}
+}
+
+// stopAll stops the flights Close has claimed. A stop func or Stopped hook
+// that panics fails Close, but only once the rest are stopped too: nobody
+// else will stop an upstream Close has claimed.
+func (g *Group[K, T]) stopAll(doomed []*flight[K, T], errs []error) []error {
+	next := 0
+	defer func() {
+		if next < len(doomed) {
+			g.stopAll(doomed[next:], nil)
+		}
+	}()
+	for next < len(doomed) {
+		f := doomed[next]
+		next++
+		errs = append(errs, g.doStop(f, ErrGroupClosed))
+	}
+	return errs
 }
 
 func (g *Group[K, T]) subscribe(key K, s *Subscription[T]) error {
@@ -238,7 +254,17 @@ func (g *Group[K, T]) subscribe(key K, s *Subscription[T]) error {
 		return err
 	}
 	s.owner = f
+	// attach runs the caller's code: Initial, a SubscribeFunc function being
+	// caught up, Hooks.Dropped. If that panics, the subscription is never
+	// returned, so give back the reference it would have held.
+	attached := false
+	defer func() {
+		if !attached {
+			_ = g.release(f)
+		}
+	}()
 	f.attach(s)
+	attached = true
 	return nil
 }
 
@@ -301,6 +327,9 @@ func (g *Group[K, T]) acquire(key K, sampler bool) (*flight[K, T], error) {
 			_ = g.doStop(f, nil)
 
 		default:
+			// Reported before anything changes, so a hook that panics takes
+			// no reference with it.
+			g.reportLocked(g.Hooks.Joined, key, f.refs+1)
 			if f.timer != nil {
 				// Back within Linger: keep it.
 				f.timer.Stop()
@@ -308,9 +337,6 @@ func (g *Group[K, T]) acquire(key K, sampler bool) (*flight[K, T], error) {
 				f.gen++
 			}
 			f.refs++
-			if g.Hooks.Joined != nil {
-				g.Hooks.Joined(key, f.refs)
-			}
 			g.mu.Unlock()
 			return f, nil
 		}
@@ -322,10 +348,16 @@ func (g *Group[K, T]) acquire(key K, sampler bool) (*flight[K, T], error) {
 // this returns. On success f is live, with one reference held for the caller.
 func (g *Group[K, T]) open(key K, f *flight[K, T]) (err error) {
 	var stop func() error
-	opened := false
+	opened, reported := false, false
 
 	defer func() {
 		g.mu.Lock()
+		// Whatever happens below, a Joined hook that panics included: the
+		// Group must not stay locked, and whoever waits on the key must hear.
+		defer func() {
+			f.wakeLocked()
+			g.mu.Unlock()
+		}()
 		switch {
 		case !opened:
 			// Failed, or the Source panicked: give the key back, so the next
@@ -338,15 +370,19 @@ func (g *Group[K, T]) open(key K, f *flight[K, T]) (err error) {
 			// that Close finds it and stops what was opened.
 			f.st, f.stop = live, stop
 			err = ErrGroupClosed
+		case !reported:
+			// Opened panicked, so the subscriber opening it gets no
+			// subscription. Publish it unreferenced all the same: the next
+			// subscriber to leave it, or Close, stops what was opened.
+			f.st, f.stop = live, stop
 		default:
 			f.st, f.stop = live, stop
-			f.refs = 1
+			// Before the reference, so a hook that panics takes none with it.
 			if g.Hooks.Joined != nil {
 				g.Hooks.Joined(key, 1)
 			}
+			f.refs = 1
 		}
-		f.wakeLocked()
-		g.mu.Unlock()
 	}()
 
 	// Before the Source, which can emit as soon as it has the Emitter, and
@@ -354,16 +390,39 @@ func (g *Group[K, T]) open(key K, f *flight[K, T]) (err error) {
 	f.replay()
 
 	stop, err = g.Source(key, f)
-	if g.Hooks.Opened != nil {
-		g.Hooks.Opened(key, err)
-	}
 	if err != nil {
+		if g.Hooks.Opened != nil {
+			g.Hooks.Opened(key, err)
+		}
 		return err // nothing to stop, even if the Source ended it before failing
 	}
-	// Set last, and not from err: a panicking Source leaves err nil, and
-	// publishing it live with no stop func would leak the upstream.
+	// Set before Opened, and not from err: a panicking Source leaves err nil,
+	// and publishing it live with no stop func would leak the upstream, while a
+	// panicking Opened must not keep what the Source opened from being stopped.
 	opened = true
+	if g.Hooks.Opened != nil {
+		g.Hooks.Opened(key, nil)
+	}
+	reported = true
 	return nil
+}
+
+// reportLocked calls a Joined or Left hook, which runs under g.mu so that the
+// counts it reports arrive in order. g.mu must be held. A hook that panics
+// fails the call it ran in, but does not take g.mu with it: that would wedge
+// every key of the Group rather than fail one call.
+func (g *Group[K, T]) reportLocked(hook func(K, int), key K, n int) {
+	if hook == nil {
+		return
+	}
+	returned := false
+	defer func() {
+		if !returned {
+			g.mu.Unlock()
+		}
+	}()
+	hook(key, n)
+	returned = true
 }
 
 // now is when a value arrived, from the Group's clock or the real one.
@@ -399,9 +458,7 @@ func (g *Group[K, T]) beginStop(f *flight[K, T]) bool {
 func (g *Group[K, T]) release(f *flight[K, T]) error {
 	g.mu.Lock()
 	f.refs--
-	if g.Hooks.Left != nil {
-		g.Hooks.Left(f.key, f.refs)
-	}
+	g.reportLocked(g.Hooks.Left, f.key, f.refs)
 	if f.refs > 0 {
 		g.mu.Unlock()
 		return nil

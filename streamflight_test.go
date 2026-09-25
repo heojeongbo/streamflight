@@ -113,6 +113,23 @@ func drain(c <-chan int) []int {
 	}
 }
 
+// returns runs f and fails the test if f has not returned within a few
+// seconds, which is what a wedged Group looks like from outside. It fails
+// rather than hangs, so a regression names itself.
+func returns(t *testing.T, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("did not return: the Group is wedged")
+	}
+}
+
 func closed(c <-chan int) bool {
 	select {
 	case _, ok := <-c:
@@ -1731,6 +1748,210 @@ func TestHooks(t *testing.T) {
 		"stopped k <nil>",
 		"opened k boom",
 	}, log)
+}
+
+func TestPanics(t *testing.T) {
+	// A panic in the caller's code fails the call it ran in. It must not leave
+	// the Group locked or anyone waiting on a key forever, and what the Source
+	// opened must still be stoppable.
+	const boom = "boom"
+
+	t.Run("a Joined hook that panics on an open key takes no reference with it", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Hooks: streamflight.Hooks[string, int]{
+				Joined: func(_ string, n int) {
+					if n == 2 {
+						panic(boom)
+					}
+				},
+			},
+		}
+
+		a, err := g.Subscribe("k")
+		x.NoError(err)
+		x.PanicsWithValue(boom, func() { g.Subscribe("k") })
+
+		var other *streamflight.Subscription[int]
+		returns(t, func() { other, err = g.Subscribe("other") })
+		x.NoError(err)
+		x.NoError(other.Close())
+		x.NoError(a.Close())
+		x.Equal([]string{"open k", "open other", "stop other", "stop k"}, r.Log(),
+			"a held the last reference to k")
+	})
+	t.Run("a Joined hook that panics while opening wakes whoever waits on the key", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			release := make(chan struct{})
+			var once atomic.Bool
+			g := &streamflight.Group[string, int]{
+				Source: func(key string, e streamflight.Emitter[int]) (func() error, error) {
+					<-release
+					return r.Source(key, e)
+				},
+				Hooks: streamflight.Hooks[string, int]{
+					Joined: func(string, int) {
+						if once.CompareAndSwap(false, true) {
+							panic(boom)
+						}
+					},
+				},
+			}
+
+			panicked := make(chan any, 1)
+			go func() {
+				defer func() { panicked <- recover() }()
+				g.Subscribe("k")
+			}()
+			synctest.Wait() // the opener is inside the Source
+			type result struct {
+				s   *streamflight.Subscription[int]
+				err error
+			}
+			waiter := make(chan result, 1)
+			go func() {
+				s, err := g.Subscribe("k")
+				waiter <- result{s, err}
+			}()
+			synctest.Wait() // and a second subscriber waits on the key
+
+			close(release)
+			x.Equal(boom, <-panicked)
+			w := <-waiter
+			x.NoError(w.err)
+			x.Equal([]string{"open k"}, r.Log(), "it joined what was opened")
+			x.NoError(w.s.Close())
+			x.Equal([]string{"open k", "stop k"}, r.Log(), "and leaving stopped it")
+		})
+	})
+	t.Run("an Opened hook that panics leaves what was opened stoppable", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		var once atomic.Bool
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Hooks: streamflight.Hooks[string, int]{
+				Opened: func(string, error) {
+					if once.CompareAndSwap(false, true) {
+						panic(boom)
+					}
+				},
+			},
+		}
+
+		x.PanicsWithValue(boom, func() { g.Subscribe("k") })
+		x.Equal([]string{"open k"}, r.Log())
+
+		var err error
+		returns(t, func() { err = g.Close() })
+		x.NoError(err)
+		x.Equal([]string{"open k", "stop k"}, r.Log(), "Close found it and stopped it")
+	})
+	t.Run("a Left hook that panics leaves the upstream stoppable", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		var once atomic.Bool
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Hooks: streamflight.Hooks[string, int]{
+				Left: func(string, int) {
+					if once.CompareAndSwap(false, true) {
+						panic(boom)
+					}
+				},
+			},
+		}
+
+		a, err := g.Subscribe("k")
+		x.NoError(err)
+		x.PanicsWithValue(boom, func() { a.Close() })
+
+		var b *streamflight.Subscription[int]
+		returns(t, func() { b, err = g.Subscribe("k") })
+		x.NoError(err)
+		x.Equal([]string{"open k"}, r.Log(), "still running, and joined")
+		x.NoError(b.Close())
+		x.Equal([]string{"open k", "stop k"}, r.Log(), "the next to leave stopped it")
+	})
+	t.Run("an Initial that panics gives back its reference and refuses its send", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		var once atomic.Bool
+		var escaped func(int)
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Initial: func(_ string, send func(int)) {
+				if once.CompareAndSwap(false, true) {
+					escaped = send
+					panic(boom)
+				}
+			},
+		}
+
+		x.PanicsWithValue(boom, func() { g.Subscribe("k") })
+		x.Equal([]string{"open k", "stop k"}, r.Log(), "its reference was the only one")
+		x.PanicsWithValue("streamflight: Group.Initial called send after returning", func() {
+			escaped(1)
+		})
+
+		var s *streamflight.Subscription[int]
+		var err error
+		returns(t, func() { s, err = g.Subscribe("k") })
+		x.NoError(err)
+		x.NoError(s.Close())
+	})
+	t.Run("a Dropped hook that panics fails the Emit, not the key", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Hooks: streamflight.Hooks[string, int]{
+				Dropped: func(string, int) { panic(boom) },
+			},
+		}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		r.emit("k", 1)
+		x.PanicsWithValue(boom, func() { r.emit("k", 2) }, "1 is displaced")
+
+		var n int
+		returns(t, func() { n = r.emit("k", 3) })
+		x.Equal(1, n)
+		x.Equal([]int{3}, drain(s.C))
+		returns(t, func() { err = s.Close() })
+		x.NoError(err)
+	})
+	t.Run("a Stopped hook that panics in Close does not keep the rest from stopping", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Hooks: streamflight.Hooks[string, int]{
+				Stopped: func(string, error) { panic(boom) },
+			},
+		}
+
+		a, err := g.Subscribe("a")
+		x.NoError(err)
+		b, err := g.Subscribe("b")
+		x.NoError(err)
+
+		x.PanicsWithValue(boom, func() { g.Close() })
+		x.ElementsMatch([]string{"open a", "open b", "stop a", "stop b"}, r.Log(),
+			"each stop panicked, and each still ran")
+		x.ErrorIs(a.Err(), streamflight.ErrGroupClosed)
+		x.ErrorIs(b.Err(), streamflight.ErrGroupClosed)
+
+		returns(t, func() { err = g.Close() })
+		x.NoError(err)
+		x.NoError(a.Close())
+		x.NoError(b.Close())
+	})
 }
 
 func TestDelivery(t *testing.T) {
