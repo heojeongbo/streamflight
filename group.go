@@ -233,7 +233,7 @@ func (g *Group[K, T]) subscribe(key K, s *Subscription[T]) error {
 		panic("streamflight: Group.Source is nil")
 	}
 
-	f, err := g.acquire(key)
+	f, err := g.acquire(key, s.fn == nil && s.ch == nil)
 	if err != nil {
 		return err
 	}
@@ -244,7 +244,8 @@ func (g *Group[K, T]) subscribe(key K, s *Subscription[T]) error {
 
 // acquire returns the upstream of key with one more reference, opening it if
 // key has none and waiting if another goroutine is opening or stopping it.
-func (g *Group[K, T]) acquire(key K) (*flight[K, T], error) {
+// sampler says whether the caller samples rather than being delivered to.
+func (g *Group[K, T]) acquire(key K, sampler bool) (*flight[K, T], error) {
 	for {
 		g.mu.Lock()
 		// Re-checked every time round, so a waiter woken by Close never parks
@@ -261,6 +262,11 @@ func (g *Group[K, T]) acquire(key K) (*flight[K, T], error) {
 			// the key is what keeps anyone else from opening it; holding the
 			// lock is not, and would stall every other key for the Source.
 			f = newFlight(g, key)
+			// A sampler that opens the key keeps what the Source emits while
+			// opening, which would otherwise arrive before attach tells the key
+			// to keep it. Set before f is published or the Source has its
+			// Emitter, like the ring, so nobody can read it yet.
+			f.wanted = sampler
 			if g.flights == nil {
 				g.flights = make(map[K]*flight[K, T])
 			}

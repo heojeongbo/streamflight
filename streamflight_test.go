@@ -487,6 +487,78 @@ func TestSubscribeLatest(t *testing.T) {
 		x.True(ok)
 		x.Equal(5, v, "the key was already keeping it")
 	})
+	t.Run("a sampler that opens the key keeps what its Source emits while opening", func(t *testing.T) {
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{
+			Source: func(_ string, e streamflight.Emitter[int]) (func() error, error) {
+				// The current state, read while subscribing to its changes.
+				x.Equal(0, e.Emit(42), "nobody is attached yet")
+				return nil, nil
+			},
+		}
+
+		s, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		defer s.Close()
+		v, _, ok := s.Latest()
+		x.True(ok, "kept without Replay, which does not reach a sampler anyway")
+		x.Equal(42, v)
+	})
+	t.Run("Poll's first tick reaches a sampler that opened the key", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			ticked := make(chan struct{}, 1)
+			poll := streamflight.Poll(time.Hour,
+				func(_ context.Context, _ string, e streamflight.Emitter[int]) error {
+					e.Emit(7)
+					select {
+					case ticked <- struct{}{}:
+					default:
+					}
+					return nil
+				})
+			g := &streamflight.Group[string, int]{
+				// Hold the open until the first tick has landed: the schedule
+				// that would lose it if the key kept values only from attach.
+				Source: func(key string, e streamflight.Emitter[int]) (func() error, error) {
+					stop, err := poll(key, e)
+					<-ticked
+					return stop, err
+				},
+			}
+
+			s, err := g.SubscribeLatest("k")
+			x.NoError(err)
+			v, _, ok := s.Latest()
+			x.True(ok, "on open, not after one interval")
+			x.Equal(7, v)
+			x.NoError(s.Close())
+		})
+	})
+	t.Run("a key nobody samples never reads the clock", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		var reads atomic.Int64
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Now: func() time.Time {
+				reads.Add(1)
+				return time.Now()
+			},
+		}
+
+		ch, err := g.Subscribe("k")
+		x.NoError(err)
+		defer ch.Close()
+		r.emit("k", 1)
+		x.Zero(reads.Load(), "a channel subscriber opened it")
+
+		s, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		defer s.Close()
+		r.emit("k", 2)
+		x.Equal(int64(1), reads.Load(), "from the first sampler on")
+	})
 	t.Run("a sampler does not hold up the values a channel gets", func(t *testing.T) {
 		x := require.New(t)
 		r := newRecorder()

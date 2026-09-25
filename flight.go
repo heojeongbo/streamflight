@@ -41,14 +41,15 @@ type flight[K comparable, T any] struct {
 	//
 	// latestMu is a leaf, taken only around these three fields and never while
 	// mu is wanted, so a reader is never behind a delivery. wanted is set by
-	// the first such subscriber and guards the cost of the clock read for
+	// the first such subscriber, from the moment it starts opening the key if
+	// it is the one that opens it, and guards the cost of the clock read for
 	// every key that has none.
 	latestMu sync.RWMutex
 	latestV  T
 	latestAt time.Time
 	latestOK bool
 	latestCh chan struct{} // closed and replaced whenever the value advances
-	wanted   bool          // guarded by mu
+	wanted   bool          // guarded by mu, once f is published
 
 	// mu guards the fields below and is held for every delivery.
 	mu     sync.Mutex
