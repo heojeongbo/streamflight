@@ -104,13 +104,16 @@ func (f *flight[K, T]) Emit(v T) int {
 	}
 
 	if f.wanted {
+		// Read before taking latestMu, so that a Now that panics does not
+		// leave the key's samplers locked out. mu already orders the Emits of
+		// a key, so reading it first reorders nothing.
+		at := f.g.now()
 		f.latestMu.Lock()
 		// Strictly after the one before it, even when the clock did not move
 		// between them: two values a caller can tell apart must have arrival
 		// times it can tell apart, or waiting for one past the other never
 		// ends. The nudge is a nanosecond and only under a clock too coarse to
 		// separate two emissions.
-		at := f.g.now()
 		if f.latestOK && !at.After(f.latestAt) {
 			at = f.latestAt.Add(time.Nanosecond)
 		}

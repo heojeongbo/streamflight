@@ -1926,6 +1926,33 @@ func TestPanics(t *testing.T) {
 		returns(t, func() { err = s.Close() })
 		x.NoError(err)
 	})
+	t.Run("a Now that panics fails the Emit, not the samplers", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		var once atomic.Bool
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Now: func() time.Time {
+				if once.CompareAndSwap(false, true) {
+					panic(boom)
+				}
+				return time.Now()
+			},
+		}
+
+		s, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		x.PanicsWithValue(boom, func() { r.emit("k", 1) })
+
+		var ok bool
+		returns(t, func() { _, _, ok = s.Latest() })
+		x.False(ok, "nothing was kept")
+		r.emit("k", 2)
+		v, _, ok := s.Latest()
+		x.True(ok)
+		x.Equal(2, v)
+		x.NoError(s.Close())
+	})
 	t.Run("a Stopped hook that panics in Close does not keep the rest from stopping", func(t *testing.T) {
 		x := require.New(t)
 		r := newRecorder()
