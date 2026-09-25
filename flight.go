@@ -237,23 +237,27 @@ func (f *flight[K, T]) attach(s *Subscription[T]) {
 // initial sends s what Initial has for it, and reports whether that cut s off.
 // A method of its own so that what its send captures is allocated only for a
 // Group that has an Initial. f.mu must be held.
-func (f *flight[K, T]) initial(s *Subscription[T], policy Overflow) (cut bool) {
+func (f *flight[K, T]) initial(s *Subscription[T], policy Overflow) bool {
 	// send borrows the key's lock, which is held only for this call. A retained
 	// send would otherwise deliver without it, racing the whole key and
 	// panicking on a queue that has since been closed. Deferred, so a send kept
-	// by an Initial that panicked is refused too.
-	var live atomic.Bool
-	live.Store(true)
-	defer live.Store(false)
+	// by an Initial that panicked is refused too. One struct rather than two
+	// variables, which send captures more cheaply.
+	var st struct {
+		live atomic.Bool
+		cut  bool
+	}
+	st.live.Store(true)
+	defer st.live.Store(false)
 	f.g.Initial(f.key, func(v T) {
-		if !live.Load() {
+		if !st.live.Load() {
 			panic("streamflight: Group.Initial called send after returning")
 		}
-		if !cut {
-			cut = f.push(s, v, policy) == evicted
+		if !st.cut {
+			st.cut = f.push(s, v, policy) == evicted
 		}
 	})
-	return cut
+	return st.cut
 }
 
 func (f *flight[K, T]) leave(s *Subscription[T]) error {
