@@ -1,5 +1,84 @@
 # Changelog
 
+## v0.4.0 — 2026-09-26
+
+No new API. Two places where the package lost values without saying so, and
+a hook or clock that panicked could wedge far more than the call it ran in.
+The documentation now starts from what is done with each value, and says what
+the code does where it did not.
+
+### Changed
+
+- **A sampler that opens a key keeps what its Source emits while opening.** A
+  key used to keep its newest value only from the moment its first sampler
+  was attached, which is after the Source returns. The current state a Source
+  sends as it subscribes, and `Poll`'s first tick whenever that landed before
+  the attach, never reached a `SubscribeLatest` subscriber that opened the
+  key, and `Replay` could not help, since a sampler is sent nothing by it. A
+  key opened by a channel or function subscriber is unchanged.
+
+- **An `Evict` subscriber whose catch-up does not fit is evicted.** What
+  `Replay` and `Initial` send a joining subscriber went through `DropOldest`
+  whatever its policy, so an `Evict` subscriber with a queue shorter than a
+  snapshot lost the start of it and carried on from a corrupt base. It now
+  ends with `ErrEvicted`, as it would for a live value it had no room for.
+  `Subscribe` returns it already ended, the same as a subscription to an
+  upstream that has ended. Other policies are unchanged.
+
+- **The first arrival time is always after the zero time.** Waiting past the
+  zero time now finds the value there even under a `Group.Now` that reports
+  the zero time, such as a fake clock nobody has advanced.
+
+### Fixed
+
+- **A `Joined` or `Left` hook that panicked wedged the whole Group.** Both run
+  under the Group lock and were called with nothing to release it, so
+  `Subscribe`, `Close` and `Group.Close` on every key stopped returning. A
+  `Joined` that panicked as a key finished opening also left whoever waited
+  on that key asleep for good. A panic in the caller's code now fails the call
+  it ran in: the lock is released, waiters are woken, and what the Source
+  opened stays stoppable, including when `Opened` panics after it. A
+  subscription whose `Initial` or catch-up panics gives its reference back.
+
+- **`Group.Close` could leave an upstream running if a stop panicked.** A stop
+  func or `Stopped` hook that panicked ended `Close` there, so upstreams it had
+  claimed but not reached, and one another goroutine was opening, were never
+  stopped, while every later `Close` returned at once. `Close` now stops them
+  all before its panic goes on.
+
+- **A `Group.Now` that panicked locked a key's samplers out.** It was read
+  under the lock `Latest` and `Wait` take, with nothing to release it.
+
+### Documentation
+
+- The README starts from what is done with each value: a write that can block
+  is `Subscribe` and `Drain`, short work is `SubscribeFunc`, the current value
+  is `SubscribeLatest`. Its first example used to write to a connection from
+  `SubscribeFunc`, the one thing the rest of it says not to do.
+- `Wait` takes its time from `Latest`, which is on the clock of `Group.Now`,
+  rather than from `time.Now`, and says whether to take it before or after the
+  write. New examples: `Group.SubscribeLatest`, `Subscription.Wait`, and a
+  `Poll` whose interval comes from the key.
+- One list of what a delivery may and may not call, a single-key Group
+  described as the reference count it is, and a panic rule that says which
+  goroutines have no call to fail.
+- Sentences that did not match the code, among them `Poll`'s first tick, which
+  can run before the opener is attached rather than always does. The v0.3.0
+  entry below is corrected the same way where it gave the same advice.
+
+### Upgrading
+
+`go get github.com/heojeongbo/streamflight@v0.4.0`. Nothing to rewrite. Two
+things are worth a look:
+
+1. A subscription made with `WithOverflow(Evict)` on a Group with `Replay` or
+   `Initial` now comes back already ended with `ErrEvicted` when its buffer is
+   shorter than what it is caught up on. Size the buffer for the snapshot, or
+   check `Err` after `Subscribe`.
+2. A `SubscribeLatest` subscriber that opens a key whose Source emits while
+   opening now finds that value in `Latest` at once. Code that took `ok ==
+   false` straight after subscribing to mean "nothing yet" sees it.
+
 ## v0.3.0 — 2026-09-22
 
 A third delivery shape, and three things every consumer was writing by hand,
