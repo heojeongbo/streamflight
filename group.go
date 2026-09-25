@@ -227,6 +227,20 @@ func (g *Group[K, T]) Close() error {
 	g.closeDone = done // from here Subscribe fails
 	g.mu.Unlock()
 	defer close(done)
+	return g.closeAll()
+}
+
+// closeAll stops every upstream of a closing Group, waiting for any another
+// goroutine is opening or stopping. A stop func or Stopped hook that panics
+// fails Close, but only once the rest are stopped too: Subscribe already
+// fails, so nobody else would stop one that finishes opening afterwards.
+func (g *Group[K, T]) closeAll() error {
+	finished := false
+	defer func() {
+		if !finished {
+			_ = g.closeAll()
+		}
+	}()
 
 	var errs []error
 	for {
@@ -247,6 +261,7 @@ func (g *Group[K, T]) Close() error {
 		errs = g.stopAll(doomed, errs)
 		if len(doomed) == 0 {
 			if w == nil {
+				finished = true
 				return errors.Join(errs...)
 			}
 			<-w
@@ -319,7 +334,7 @@ func (g *Group[K, T]) acquire(key K, sampler bool) (*flight[K, T], error) {
 			// A sampler that opens the key keeps what the Source emits while
 			// opening, which would otherwise arrive before attach tells the key
 			// to keep it. Set before f is published or the Source has its
-			// Emitter, like the ring, so nobody can read it yet.
+			// Emitter, so nobody can read it yet.
 			f.wanted = sampler
 			if g.flights == nil {
 				g.flights = make(map[K]*flight[K, T])

@@ -39,11 +39,11 @@ type flight[K comparable, T any] struct {
 	// delivered to. One per key rather than one per subscriber: they all want
 	// the same answer, so Emit stores it once however many are watching.
 	//
-	// latestMu is a leaf, taken only around these three fields and never while
-	// mu is wanted, so a reader is never behind a delivery. wanted is set by
-	// the first such subscriber, from the moment it starts opening the key if
-	// it is the one that opens it, and guards the cost of the clock read for
-	// every key that has none.
+	// latestMu is a leaf, taken only around the four latest* fields and never
+	// while mu is wanted, so a reader is never behind a delivery. wanted is set
+	// by the first such subscriber, from the moment it starts opening the key
+	// if it is the one that opens it, and guards the cost of the clock read for
+	// every key that has never had one.
 	latestMu sync.RWMutex
 	latestV  T
 	latestAt time.Time
@@ -113,8 +113,9 @@ func (f *flight[K, T]) Emit(v T) int {
 		// between them: two values a caller can tell apart must have arrival
 		// times it can tell apart, or waiting for one past the other never
 		// ends. The nudge is a nanosecond and only under a clock too coarse to
-		// separate two emissions.
-		if f.latestOK && !at.After(f.latestAt) {
+		// separate two emissions. The first value is after the zero time too,
+		// whatever the clock says, so waiting past the zero time finds it.
+		if !at.After(f.latestAt) {
 			at = f.latestAt.Add(time.Nanosecond)
 		}
 		f.latestV, f.latestAt, f.latestOK = v, at, true
