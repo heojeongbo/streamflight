@@ -114,8 +114,8 @@ type Group[K comparable, T any] struct {
 	// testing/synctest there is no need to: time.Now is already the bubble's
 	// clock, and time.Sleep ages a value. It is called under the key's lock
 	// while the key's values are being published, so keep it short and do not
-	// call back into the Group. A key calls it only once a sampler has joined
-	// it, and then for each value until its upstream stops.
+	// call back into the Group. A key calls it for each value from the moment a
+	// sampler starts opening it or joins it, until its upstream stops.
 	Now func() time.Time
 
 	mu        sync.Mutex
@@ -132,10 +132,11 @@ type Group[K comparable, T any] struct {
 // A hook that panics fails the call that reported it: the Group is not left
 // locked and nobody is left waiting on a key, but a key whose Opened, Joined
 // or Left panicked may go on running until its next subscriber leaves it or
-// the Group is closed. A Stopped hook called when a key's Linger runs out, and
-// a Dropped hook reached from a [Run] or [Poll] function, run on a goroutine
-// the package started, where there is no call to fail and a panic crashes the
-// program.
+// the Group is closed. A Stopped hook called when a key's Linger runs out runs
+// on a goroutine the package started, where there is no call to fail and a
+// panic crashes the program. A Dropped hook that panics fails the Emit that
+// reached it, which on the goroutine of a [Run] or [Poll] function crashes the
+// program unless that function recovers it.
 type Hooks[K comparable, T any] struct {
 	// Opened is called after the Source of key was called, with its error.
 	Opened func(key K, err error)
@@ -206,8 +207,8 @@ func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error)
 //
 // It costs the key one stored value however many subscribers sample it, and
 // costs a subscriber no more per value than a step through a loop. A key
-// stores nothing until a sampler joins it, and from then on keeps its newest
-// value until its upstream stops.
+// stores nothing until a sampler starts opening it or joins it, and from then
+// on keeps its newest value until its upstream stops.
 //
 // A key a sampler opens keeps what its Source emits while opening, such as the
 // current state it read on subscribing. The first sampler of a key someone
@@ -243,10 +244,11 @@ func (g *Group[K, T]) Close() error {
 	return g.closeAll()
 }
 
-// closeAll stops every upstream of a closing Group, waiting for any another
-// goroutine is opening or stopping. A stop func or Stopped hook that panics
-// fails Close, but only once the rest are stopped too: Subscribe already
-// fails, so nobody else would stop one that finishes opening afterwards.
+// closeAll stops every upstream of a closing Group, waiting for any that
+// another goroutine is opening or stopping. A stop func or Stopped hook that
+// panics fails Close, but only once the rest are stopped too: Subscribe
+// already fails, so nobody else would stop one that finishes opening
+// afterwards.
 func (g *Group[K, T]) closeAll() error {
 	finished := false
 	defer func() {

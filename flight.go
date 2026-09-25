@@ -112,9 +112,11 @@ func (f *flight[K, T]) Emit(v T) int {
 		// Strictly after the one before it, even when the clock did not move
 		// between them: two values a caller can tell apart must have arrival
 		// times it can tell apart, or waiting for one past the other never
-		// ends. The nudge is a nanosecond and only under a clock too coarse to
-		// separate two emissions. The first value is after the zero time too,
-		// whatever the clock says, so waiting past the zero time finds it.
+		// ends. Whenever the clock does not read after the time before it,
+		// being too coarse to separate two emissions, standing still or set
+		// back, the value gets that time plus a nanosecond instead, however far
+		// that is from the clock. The time before the first value is the zero
+		// time, so waiting past the zero time finds it under any clock.
 		if !at.After(f.latestAt) {
 			at = f.latestAt.Add(time.Nanosecond)
 		}

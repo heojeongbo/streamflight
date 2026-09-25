@@ -87,9 +87,10 @@
 //   - After [Subscription.Close] returns, its subscriber is never delivered to
 //     again. A delivery in progress completes first.
 //   - Values emitted after the upstream is stopped or has ended are dropped.
-//   - Keys are independent: outside [Group.Close], which stops keys one at a
-//     time, opening or stopping one key never waits for another, and neither
-//     does a subscriber that has fallen behind.
+//   - Keys are independent: opening or stopping one key never waits for
+//     another, and neither does a subscriber that has fallen behind, except
+//     inside [Group.Close], which stops keys one at a time, and while a Joined
+//     or Left hook runs under the lock the whole Group shares.
 //
 // # Rules
 //
@@ -99,12 +100,13 @@
 //     for what a subscriber is sent as it joins, on the subscribing one.
 //     [Group.Initial], [Group.Now] and the Dropped hook run under that lock too.
 //     From there it is safe to read [Subscription.Latest], Err and Dropped,
-//     which never wait, and to Emit on another key, which is how a stream
-//     derived from this one is fed, unless what that key delivers leads back
-//     to this one. It is not safe to subscribe or to Close a subscription on
-//     any key, since either can run a Source or stop func that needs this key,
-//     nor to call [Subscription.Wait], Emit or End on the same key, or to close
-//     the Group: each waits on the lock the delivery holds, and deadlocks.
+//     which never wait. A SubscribeFunc function or Initial may also Emit on
+//     another key, which is how a stream derived from this one is fed, unless
+//     what that key delivers leads back to this one. It is not safe to
+//     subscribe or to Close a subscription on any key, since either can run a
+//     Source or stop func that needs this key, nor to call [Subscription.Wait],
+//     Emit or End on the same key, or to close the Group: each waits on the
+//     lock the delivery holds, and deadlocks.
 //   - Open and stop run with no Group lock held, and different keys open and
 //     stop at the same time. A [Source], [Group.ReplayFor], its stop func and
 //     any goroutine they own may use the Group: they may subscribe to other
@@ -130,10 +132,12 @@
 //   - A panic in the caller's code, whether a hook, [Group.Initial],
 //     [Group.Now], a SubscribeFunc function, a Source or a stop func, fails the
 //     call it ran in: the Group is not left locked, and nobody is left waiting
-//     on a key, though the key's upstream may go on running until its next
-//     subscriber leaves it or the Group is closed. On a goroutine the package
-//     starts there is no call to fail, and a panic crashes the program as on
-//     any goroutine: the timer that stops a key once its Linger runs out,
-//     which calls the stop func and the Stopped hook, and the one [Run] and
-//     [Poll] call their function on, with whatever its Emit calls.
+//     on a key. A key whose Opened, Joined or Left hook panicked may go on
+//     running until its next subscriber leaves it or the Group is closed, and
+//     whatever a Source or stop func had started and not stopped when it
+//     panicked, the Group never stops. On a goroutine the package starts there
+//     is no call to fail, and a panic crashes the program as on any goroutine:
+//     the timer that stops a key once its Linger runs out, which calls the
+//     stop func and the Stopped hook, and the one [Run] and [Poll] call their
+//     function on, unless that function recovers it.
 package streamflight

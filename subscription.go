@@ -150,10 +150,10 @@ func (s *Subscription[T]) Dropped() uint64 {
 // changes means nothing changed, and on a sensor means the sensor is gone.
 //
 // Once the subscription has ended, Latest goes on reading the upstream it was
-// on: its newer values for as long as other subscribers keep it running, and
-// its last value once it has stopped. Done or Err says whether this
-// subscription is still live. It never sees the fresh upstream that the key's
-// next subscriber opens.
+// on: its newer values for as long as it runs, for other subscribers or while
+// it lingers, and its last value once it has ended or been stopped. Done or
+// Err says whether this subscription is still live. It never sees the fresh
+// upstream that the key's next subscriber opens.
 func (s *Subscription[T]) Latest() (v T, at time.Time, ok bool) {
 	if s.fn != nil || s.ch != nil {
 		panic("streamflight: Latest on a subscription that is delivered to")

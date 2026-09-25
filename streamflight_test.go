@@ -2146,6 +2146,64 @@ func TestPanics(t *testing.T) {
 			x.NoError(a.Close())
 		})
 	})
+	t.Run("a second stop that panics while Close finishes still leaves nothing running", func(t *testing.T) {
+		// Which opening key Close waits on first follows map order, so go
+		// round enough times to take both.
+		for range 20 {
+			synctest.Test(t, func(t *testing.T) {
+				x := require.New(t)
+				r := newRecorder()
+				gates := map[string]chan struct{}{"b": make(chan struct{}), "c": make(chan struct{})}
+				g := &streamflight.Group[string, int]{
+					Source: func(key string, e streamflight.Emitter[int]) (func() error, error) {
+						if gate, ok := gates[key]; ok {
+							<-gate
+						}
+						return r.Source(key, e)
+					},
+					Hooks: streamflight.Hooks[string, int]{
+						Stopped: func(key string, _ error) {
+							if key != "c" {
+								panic(boom + " " + key)
+							}
+						},
+					},
+				}
+
+				a, err := g.Subscribe("a")
+				x.NoError(err)
+				opened := make(chan error, 2)
+				for _, key := range []string{"b", "c"} {
+					go func() {
+						_, err := g.Subscribe(key)
+						opened <- err
+					}()
+				}
+				synctest.Wait() // b and c are opening
+
+				closed := make(chan any, 1)
+				go func() {
+					defer func() { closed <- recover() }()
+					g.Close()
+				}()
+				synctest.Wait()
+				close(gates["b"])
+				synctest.Wait()
+				close(gates["c"])
+
+				x.NotNil(<-closed)
+				x.ErrorIs(<-opened, streamflight.ErrGroupClosed)
+				x.ErrorIs(<-opened, streamflight.ErrGroupClosed)
+				x.ElementsMatch([]string{"open a", "stop a", "open b", "stop b", "open c", "stop c"}, r.Log(),
+					"every upstream stopped, whichever stops panicked on the way")
+
+				var err2 error
+				returns(t, func() { err2 = g.Close() })
+				x.NoError(err2)
+				x.NoError(a.Close())
+			})
+		}
+	})
 }
 
 func TestDelivery(t *testing.T) {

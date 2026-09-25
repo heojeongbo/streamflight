@@ -37,12 +37,12 @@ to the exported surface is eight new names.
   key, so two values a caller can tell apart always have times it can tell
   apart, whatever the clock's resolution.
 
-  A key nobody samples is unaffected: `Emit` stays at 5.4 ns and allocates
-  nothing. There is no value until the first one emitted after the first
-  sampler joined, and whether a value is still current is the caller's to
-  decide from the arrival time `Latest` returns — silence on a topic published
-  only when it changes means nothing changed, and on a sensor means the sensor
-  is gone.
+  A key that has never had a sampler is unaffected: `Emit` stays at 5.4 ns and
+  allocates nothing. There is no value until the first one emitted after the
+  first sampler joined, and whether a value is still current is the caller's
+  to decide from the arrival time `Latest` returns — silence on a topic
+  published only when it changes means nothing changed, and on a sensor means
+  the sensor is gone.
 
 - **`Subscription.Drain(ctx, send)`** — the body of a handler relaying one key
   to one client: the select on the context and the channel, the closed-channel
@@ -77,7 +77,8 @@ to the exported surface is eight new names.
 - **`Group.Now`** — where a value gets the arrival time `Latest` reports and
   `Wait` waits past; defaults to `time.Now`. Set it to age a value from a test,
   because whether a value is still current is the caller's to decide and
-  deciding it is worth a test. A key nobody samples never calls it.
+  deciding it is worth a test. A key that has never had a sampler never calls
+  it.
 
 - **`ErrPollInterval`** — why opening a key fails when `Poll` was given an
   interval that is not positive, rather than spinning.
@@ -86,8 +87,9 @@ to the exported surface is eight new names.
   key's newest before it is delivered to any subscriber.** A subscriber woken
   by such a value therefore reads that same value from `Latest`, never the one
   before it — which is what lets one subscription carry the state and another
-  the edge, the shape a latch with a change hook needs. The implementation
-  already did this; now it is promised.
+  the edge, the shape a latch with a change hook needs. It holds for values
+  delivered as they are emitted, not for what Replay sends a subscriber as it
+  joins. The implementation already did this; now it is promised.
 
 ### Fixed
 
