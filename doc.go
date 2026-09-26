@@ -117,7 +117,10 @@
 //     wait for itself.
 //   - A stop func must return. Its key is unavailable until it does, and
 //     [Group.Close], which stops keys one at a time, waits for it before it
-//     stops the next. Outside Close, no other key is held up by it.
+//     stops the next. Outside Close, no other key is held up by it. Close
+//     also ends every key it stops before it runs any of their stops, and so
+//     waits first for each of their deliveries in progress: a delivery must
+//     not wait on anything that only a stop in the same Group would release.
 //   - Subscribe waits while another goroutine is opening or stopping the same
 //     key. It never waits for another key's Source or stop func.
 //     [Group.SubscribeContext] and its siblings stop waiting, on that and on

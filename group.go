@@ -363,7 +363,10 @@ func (g *Group[K, T]) closeAll() error {
 		// key, as a derived stream's does, waits for that key's delivery,
 		// which only that key's own stop would release otherwise. Then end
 		// every subscriber of them, so that a released Block subscriber is not
-		// left live and refused values. Only then run the stops.
+		// left live and refused values for as long as other keys' deliveries
+		// and stops take; a delivery in progress on its own key still holds
+		// it until that returns. Only then run the stops, so none runs until
+		// each of these keys' deliveries in progress has returned.
 		for _, f := range doomed {
 			f.unblock()
 		}
