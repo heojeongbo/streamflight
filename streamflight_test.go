@@ -1592,6 +1592,42 @@ func TestGroupClose(t *testing.T) {
 		x.NoError(<-first)
 		x.NoError(<-second)
 	})
+	t.Run("a Block subscriber is ended, not refused values, while other keys stop", func(t *testing.T) {
+		for range 10 { // a first or b first
+			synctest.Test(t, func(t *testing.T) {
+				x := require.New(t)
+				gate := make(chan struct{})
+				var b streamflight.Emitter[int]
+				g := &streamflight.Group[string, int]{
+					Source: func(key string, e streamflight.Emitter[int]) (func() error, error) {
+						if key == "b" {
+							b = e
+							return nil, nil
+						}
+						return func() error { <-gate; return nil }, nil // a slow stop
+					},
+				}
+
+				a, err := g.Subscribe("a")
+				x.NoError(err)
+				blk, err := g.Subscribe("b", streamflight.WithOverflow(streamflight.Block))
+				x.NoError(err)
+				b.Emit(1) // blk's queue is full
+
+				closed := make(chan error, 1)
+				go func() { closed <- g.Close() }()
+				synctest.Wait() // whichever stop runs first, blk is ended before any
+
+				x.ErrorIs(blk.Err(), streamflight.ErrGroupClosed, "not left live to be refused")
+				x.Equal(0, b.Emit(2), "nobody left to take it")
+				close(gate)
+				x.NoError(<-closed)
+				x.Equal([]int{1}, drain(blk.C))
+				x.NoError(a.Close())
+				x.NoError(blk.Close())
+			})
+		}
+	})
 	t.Run("a stop that closes a subscription to a key with a stalled Block subscriber does not hang", func(t *testing.T) {
 		// derived is fed by a subscription to raw, which its stop closes. raw
 		// has a Block subscriber that stopped reading, so raw's delivery holds
