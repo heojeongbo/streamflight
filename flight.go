@@ -16,11 +16,9 @@ type flight[K comparable, T any] struct {
 	stop func() error
 
 	// quit is closed when the flight ends or is stopped, so an Emit waiting on
-	// a Block subscriber gives up before the ending needs mu, and ends that
-	// subscriber with quitErr, which is written before quit is closed.
+	// a Block subscriber gives up before the ending needs mu.
 	quit     chan struct{}
 	quitOnce sync.Once
-	quitErr  error
 
 	// Guarded by g.mu.
 	refs  int
@@ -81,8 +79,7 @@ type outcome int
 const (
 	accepted outcome = iota
 	rejected
-	evicted  // cut off by Evict
-	released // cut off by the key ending while it held up a Block delivery
+	evicted
 )
 
 func newFlight[K comparable, T any](g *Group[K, T], key K) *flight[K, T] {
@@ -146,39 +143,39 @@ func (f *flight[K, T]) Emit(v T) int {
 
 	n := 0
 	for i, s := range f.subs {
-		switch o := f.push(s, v, s.overflow); o {
+		switch f.push(s, v, s.overflow) {
 		case accepted:
 			n++
-		case evicted, released:
-			return n + f.cutFrom(i, o, v)
+		case evicted:
+			return n + f.evictFrom(i, v)
 		}
 	}
 	return n
 }
 
-// cutFrom takes out f.subs[i], which delivering v has just cut off with o, and
-// delivers v to the subscribers after it, taking out any others it cuts off on
+// evictFrom takes out f.subs[i], which delivering v has just evicted, and
+// delivers v to the subscribers after it, taking out any others it evicts on
 // the way. One pass moves each subscriber that stays once, however many go,
 // where taking each out in place would move all those after it every time. A
 // delivery that panics still leaves f.subs whole: those it had not reached
 // stay, as they would have without it. It returns how many accepted v. f.mu
 // must be held.
-func (f *flight[K, T]) cutFrom(i int, o outcome, v T) (n int) {
+func (f *flight[K, T]) evictFrom(i int, v T) (n int) {
 	kept, next := i, i+1 // f.subs[:kept] stay; f.subs[next:] are not reached yet
 	defer func() {
 		m := copy(f.subs[kept:], f.subs[next:])
 		clear(f.subs[kept+m:])
 		f.subs = f.subs[:kept+m]
 	}()
-	f.cutOff(f.subs[i], o)
+	f.evict(f.subs[i])
 
 	for next < len(f.subs) {
 		s := f.subs[next]
 		o := f.push(s, v, s.overflow) // a panic here leaves s among those not reached
 		next++
 		switch o {
-		case evicted, released:
-			f.cutOff(s, o)
+		case evicted:
+			f.evict(s)
 			continue
 		case accepted:
 			n++
@@ -193,7 +190,7 @@ func (f *flight[K, T]) End(err error) {
 	if err == nil {
 		err = io.EOF
 	}
-	f.unblock(err)
+	f.unblock()
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -207,14 +204,18 @@ func (f *flight[K, T]) End(err error) {
 	}
 }
 
-// unblock lets an Emit waiting on a Block subscriber go, and has it end that
-// subscriber with reason, since the key is ending anyway. The first reason
-// given is the one used.
-func (f *flight[K, T]) unblock(reason error) {
-	f.quitOnce.Do(func() {
-		f.quitErr = reason
-		close(f.quit)
-	})
+// endClosed ends every subscriber of a flight its Group's Close has claimed,
+// and lets go of mu, which the caller must hold.
+func (f *flight[K, T]) endClosed() {
+	defer f.mu.Unlock()
+	if !f.done {
+		f.finish(ErrGroupClosed)
+	}
+}
+
+// unblock lets an Emit waiting on a Block subscriber go.
+func (f *flight[K, T]) unblock() {
+	f.quitOnce.Do(func() { close(f.quit) })
 }
 
 // waitLocked returns a channel closed when f leaves the phase it is in. The
@@ -460,12 +461,9 @@ func (f *flight[K, T]) push(s *Subscription[T], v T, policy Overflow) outcome {
 		case s.ch <- v:
 			return accepted
 		case <-s.closing:
-			return rejected
 		case <-f.quit:
-			// The key is ending. End s now, rather than leave it live and
-			// refusing values until the ending comes round to it.
-			return released
 		}
+		return rejected
 
 	case Evict:
 		return evicted
@@ -482,16 +480,6 @@ func (f *flight[K, T]) push(s *Subscription[T], v T, policy Overflow) outcome {
 		s.ch <- v
 		return accepted
 	}
-}
-
-// cutOff ends s, which delivering has cut off with o. s must already be out of
-// f.subs, or be about to be taken out even if a hook panics. f.mu must be held.
-func (f *flight[K, T]) cutOff(s *Subscription[T], o outcome) {
-	if o == released {
-		s.end(f.quitErr)
-		return
-	}
-	f.evict(s)
 }
 
 // evict ends s, which Evict has cut off, and reports it. s must already be out

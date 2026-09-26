@@ -1649,7 +1649,7 @@ func TestGroupClose(t *testing.T) {
 			})
 		}
 	})
-	t.Run("a Block subscriber released by Close is ended at once, whatever Close waits on", func(t *testing.T) {
+	t.Run("a Block subscriber released by Close is ended, whatever else Close waits on", func(t *testing.T) {
 		for range 10 { // a before b, or b before a
 			x := require.New(t)
 			// Key x of another Group, whose Block subscriber has stopped
@@ -1694,7 +1694,10 @@ func TestGroupClose(t *testing.T) {
 			closed := make(chan error, 1)
 			go func() { closed <- g.Close() }()
 			x.Equal(0, emitters["b"].Emit(2), "released by Close")
-			x.ErrorIs(blk.Err(), streamflight.ErrGroupClosed, "and ended in the same breath, not left live")
+			eventually(t, func() bool { return blk.Err() != nil },
+				"b is ended while Close still waits on a, not left live and refused values")
+			x.ErrorIs(blk.Err(), streamflight.ErrGroupClosed)
+			x.Empty(closed, "Close still waits on a")
 
 			x.Equal(0, <-xStalled.C) // x moves again, and so does Close
 			returns(t, func() { err = <-closed })

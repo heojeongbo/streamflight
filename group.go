@@ -1,7 +1,6 @@
 package streamflight
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"sync"
@@ -362,21 +361,13 @@ func (g *Group[K, T]) closeAll() error {
 		// First release every delivery waiting on a Block subscriber of a key
 		// about to stop: a stop func that closes a subscription to another
 		// key, as a derived stream's does, waits for that key's delivery,
-		// which only that key's own stop would release otherwise. A Block
-		// subscriber released this way is ended there and then, so it is
-		// never left live while values pass it by. Then end every other
-		// subscriber of them, so that all have heard before any stop runs.
-		// Only then run the stops.
+		// which only that key's own stop would release otherwise. Then end
+		// every subscriber of them, so that a released Block subscriber is not
+		// left live and refused values. Only then run the stops.
 		for _, f := range doomed {
-			f.unblock(ErrGroupClosed)
+			f.unblock()
 		}
-		for _, f := range doomed {
-			f.mu.Lock()
-			if !f.done {
-				f.finish(ErrGroupClosed)
-			}
-			f.mu.Unlock()
-		}
+		endAll(doomed)
 		errs = g.stopAll(doomed, errs)
 		if len(doomed) == 0 {
 			if w == nil {
@@ -386,6 +377,27 @@ func (g *Group[K, T]) closeAll() error {
 			<-w
 		}
 	}
+}
+
+// endAll ends every subscriber of the flights Close has claimed. Ending one
+// waits for its delivery in progress, which may take as long as a subscriber
+// makes it, so a flight whose lock is held is ended on a goroutine of its own
+// rather than keep the rest waiting: otherwise a Block subscriber released
+// already would be refused values while it still reads as live, for as long
+// as another key's delivery takes. It returns once all are ended.
+func endAll[K comparable, T any](doomed []*flight[K, T]) {
+	var held sync.WaitGroup
+	for _, f := range doomed {
+		if f.mu.TryLock() {
+			f.endClosed()
+			continue
+		}
+		held.Go(func() {
+			f.mu.Lock()
+			f.endClosed()
+		})
+	}
+	held.Wait()
 }
 
 // stopAll stops the flights Close has claimed. A stop func or Stopped hook
@@ -693,8 +705,7 @@ func (g *Group[K, T]) doStop(f *flight[K, T], reason error) error {
 		g.mu.Unlock()
 	}()
 
-	// With no reason, nobody is left subscribed but one that is closing.
-	f.unblock(cmp.Or(reason, ErrClosed))
+	f.unblock()
 	f.mu.Lock()
 	if !f.done {
 		f.finish(reason)

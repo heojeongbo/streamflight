@@ -33,9 +33,7 @@ const (
 	// subscribed is lost, but every other subscriber of the key, and the Source
 	// itself, waits too. Closing the subscription, ending the upstream or
 	// closing the Group releases it, and the value it was waiting to deliver is
-	// not delivered. When the upstream ends or the Group closes, the
-	// subscriber is ended with it there and then, never left live while
-	// values pass it by.
+	// not delivered.
 	Block
 
 	// Evict closes the subscriber with ErrEvicted. Right when a gap would make
