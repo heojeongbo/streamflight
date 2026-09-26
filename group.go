@@ -1,6 +1,7 @@
 package streamflight
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"sync"
@@ -200,16 +201,18 @@ func (g *Group[K, T]) Subscribe(key K, opts ...SubscribeOption) (*Subscription[T
 // lock queue for it, and one goroutine per key waits for it on their behalf
 // until it is free and nobody is queued.
 //
-// It cannot give up while it runs code that takes no context: the Source and
-// ReplayFor when it is the one opening the key, and a stop func it runs
-// itself. It lets those return, and then gives back what it took, the way a
-// last subscriber leaving would: stopped at once, or after [Group.Linger]. So
-// without Linger, another subscriber that was waiting on the same open may
-// find it stopped, and open it afresh. If the open it ran fails, or a Close
-// began while it ran, it returns that error instead, as Subscribe would. Nor
-// does it give up once it has the key's lock: from there it sends what Replay
-// and Initial have for it and joins, returning the subscription even if ctx is
-// done by then.
+// It cannot give up while it runs code that takes no context, or waits for code
+// that does not: the Source, ReplayFor and the Opened hook when it is the one
+// opening the key, and the stop of an upstream that ended by itself, which it
+// runs, waiting first for the key's lock, held while the Ended hook runs. Once
+// those return, it gives back what it took, the way a last subscriber leaving
+// would: stopped at once, which runs the stop func there and then, or after
+// [Group.Linger]. So without Linger, another subscriber that was waiting on the
+// same open may find it stopped, and open it afresh. If the open it ran fails,
+// or a Close began while it ran, it returns that error instead, as Subscribe
+// would. Nor does it give up once it has the key's lock: from there it sends
+// what Replay and Initial have for it and joins, returning the subscription
+// even if ctx is done by then.
 //
 // ctx bounds joining and nothing else. Once SubscribeContext has returned a
 // subscription, ctx has no effect on it, and giving up never ends the upstream
@@ -355,17 +358,17 @@ func (g *Group[K, T]) closeAll() error {
 		}
 		g.mu.Unlock()
 
-		// In three steps, so that no key's stop waits on another's delivery
-		// and no subscriber outlives its key's release. First release every
-		// delivery waiting on a Block subscriber of a key about to stop: a
-		// stop func that closes a subscription to another key, as a derived
-		// stream's does, waits for that key's delivery, which only that key's
-		// own stop would release otherwise. Then end every subscriber of
-		// them, so that a released Block subscriber is not refused values
-		// while it still reads as live, for as long as the stops before its
-		// own take. Only then run the stops.
+		// In three steps, so that no key's stop waits on another's delivery.
+		// First release every delivery waiting on a Block subscriber of a key
+		// about to stop: a stop func that closes a subscription to another
+		// key, as a derived stream's does, waits for that key's delivery,
+		// which only that key's own stop would release otherwise. A Block
+		// subscriber released this way is ended there and then, so it is
+		// never left live while values pass it by. Then end every other
+		// subscriber of them, so that all have heard before any stop runs.
+		// Only then run the stops.
 		for _, f := range doomed {
-			f.unblock()
+			f.unblock(ErrGroupClosed)
 		}
 		for _, f := range doomed {
 			f.mu.Lock()
@@ -690,7 +693,8 @@ func (g *Group[K, T]) doStop(f *flight[K, T], reason error) error {
 		g.mu.Unlock()
 	}()
 
-	f.unblock()
+	// With no reason, nobody is left subscribed but one that is closing.
+	f.unblock(cmp.Or(reason, ErrClosed))
 	f.mu.Lock()
 	if !f.done {
 		f.finish(reason)

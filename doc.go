@@ -121,7 +121,8 @@
 //   - Subscribe waits while another goroutine is opening or stopping the same
 //     key. It never waits for another key's Source or stop func.
 //     [Group.SubscribeContext] and its siblings stop waiting, on that and on
-//     a delivery that holds the key's lock, once their context is done.
+//     a delivery that holds the key's lock, once their context is done,
+//     except while they stop an upstream that ended by itself.
 //   - The Joined and Left hooks run under a lock shared by the whole Group, so
 //     that their counts are reported in order. Keep them short, and do not
 //     call back into the Group from any hook. Opened and Stopped run with no

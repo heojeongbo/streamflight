@@ -1649,6 +1649,63 @@ func TestGroupClose(t *testing.T) {
 			})
 		}
 	})
+	t.Run("a Block subscriber released by Close is ended at once, whatever Close waits on", func(t *testing.T) {
+		for range 10 { // a before b, or b before a
+			x := require.New(t)
+			// Key x of another Group, whose Block subscriber has stopped
+			// reading. a's delivery feeds x, so it holds a's lock for as long
+			// as x is stalled, and Close waits on it before it can end b.
+			var ex streamflight.Emitter[int]
+			other := &streamflight.Group[string, int]{
+				Source: func(_ string, e streamflight.Emitter[int]) (func() error, error) {
+					ex = e
+					return nil, nil
+				},
+			}
+			reached := make(chan struct{})
+			signal, err := other.SubscribeFunc("x", func(v int) {
+				if v == 1 {
+					close(reached)
+				}
+			})
+			x.NoError(err)
+			xStalled, err := other.Subscribe("x", streamflight.WithOverflow(streamflight.Block))
+			x.NoError(err)
+			ex.Emit(0) // xStalled is full
+
+			var mu sync.Mutex
+			emitters := map[string]streamflight.Emitter[int]{}
+			g := &streamflight.Group[string, int]{
+				Source: func(key string, e streamflight.Emitter[int]) (func() error, error) {
+					mu.Lock()
+					emitters[key] = e
+					mu.Unlock()
+					return nil, nil
+				},
+			}
+			a, err := g.SubscribeFunc("a", func(v int) { ex.Emit(v) })
+			x.NoError(err)
+			blk, err := g.Subscribe("b", streamflight.WithOverflow(streamflight.Block))
+			x.NoError(err)
+			emitters["b"].Emit(1) // blk is full
+			go emitters["a"].Emit(1)
+			<-reached // a's delivery now waits on xStalled
+
+			closed := make(chan error, 1)
+			go func() { closed <- g.Close() }()
+			x.Equal(0, emitters["b"].Emit(2), "released by Close")
+			x.ErrorIs(blk.Err(), streamflight.ErrGroupClosed, "and ended in the same breath, not left live")
+
+			x.Equal(0, <-xStalled.C) // x moves again, and so does Close
+			returns(t, func() { err = <-closed })
+			x.NoError(err)
+			x.Equal([]int{1}, drain(blk.C))
+			for _, s := range []*streamflight.Subscription[int]{a, blk, signal, xStalled} {
+				x.NoError(s.Close())
+			}
+			x.NoError(other.Close())
+		}
+	})
 	t.Run("a stop that closes a subscription to a key with a stalled Block subscriber does not hang", func(t *testing.T) {
 		// derived is fed by a subscription to raw, which its stop closes. raw
 		// has a Block subscriber that stopped reading, so raw's delivery holds
@@ -2177,37 +2234,43 @@ func TestSubscribeContext(t *testing.T) {
 		x.NoError(stalled.Close())
 		x.Equal([]string{"open k", "stop k"}, r.Log(), "its reference was given back")
 	})
-	t.Run("it joins once the delivery it waited on is done", func(t *testing.T) {
+	t.Run("it joins once the delivery it waited on is done, each time", func(t *testing.T) {
 		x := require.New(t)
 		r := newRecorder()
 		g := &streamflight.Group[string, int]{Source: r.Source}
 
-		reached := make(chan struct{})
-		first, err := g.SubscribeFunc("k", func(v int) {
-			if v == 2 {
-				close(reached)
-			}
-		})
+		seen := make(chan int, 16)
+		first, err := g.SubscribeFunc("k", func(v int) { seen <- v })
 		x.NoError(err)
 		stalled, err := g.Subscribe("k", streamflight.WithOverflow(streamflight.Block))
 		x.NoError(err)
-		r.emit("k", 1)
-		go r.emit("k", 2)
-		<-reached
-		time.Sleep(10 * time.Millisecond)
 
-		joined := make(chan *streamflight.Subscription[int], 1)
-		go func() { joined <- must(g.SubscribeContext(t.Context(), "k", streamflight.WithBuffer(4))) }()
-		eventually(t, helping, "it queues for the lock")
-		x.Equal(1, <-stalled.C)
-		s := <-joined
-		x.Equal(2, <-stalled.C) // room for the next
-		r.emit("k", 3)
-		x.Equal(3, <-s.C)
+		var joined []*streamflight.Subscription[int]
+		for round := range 2 { // the lock is handed over again, for the next
+			fill, held := 2*round+1, 2*round+2
+			r.emit("k", fill) // stalled is full
+			x.Equal(fill, <-seen)
+			go r.emit("k", held)
+			x.Equal(held, <-seen) // this delivery now waits on stalled, holding the lock
 
-		for _, s := range []*streamflight.Subscription[int]{first, stalled, s} {
+			join := make(chan *streamflight.Subscription[int], 1)
+			go func() { join <- must(g.SubscribeContext(t.Context(), "k", streamflight.WithBuffer(4))) }()
+			eventually(t, helping, "it queues for the lock")
+			x.Equal(fill, <-stalled.C)
+			var s *streamflight.Subscription[int]
+			returns(t, func() { s = <-join })
+			x.Equal(held, <-stalled.C)
+			eventually(t, func() bool { return !helping() }, "the lock is let go")
+			joined = append(joined, s)
+		}
+		r.emit("k", 9)
+		x.Equal([]int{3, 4, 9}, drain(joined[0].C))
+		x.Equal([]int{9}, drain(joined[1].C))
+
+		for _, s := range append(joined, first, stalled) {
 			x.NoError(s.Close())
 		}
+		x.Equal([]string{"open k", "stop k"}, r.Log())
 	})
 	t.Run("callers that keep giving up on a held key cost it one goroutine", func(t *testing.T) {
 		x := require.New(t)
