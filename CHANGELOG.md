@@ -1,5 +1,83 @@
 # Changelog
 
+## v0.4.1 — 2026-09-27
+
+A hang in `Group.Close`, two silent misuses turned into loud ones, and what a
+review of real use asked for: a subscribe that a cancelled request can walk
+away from, and hooks that tell a failing upstream from a stopped one and a
+slow consumer from a refused value. Nothing to rewrite, but two calls that
+used to be accepted now panic; see *Upgrading*.
+
+### Added
+
+- **`SubscribeContext`, `SubscribeFuncContext` and `SubscribeLatestContext`**
+  — `Subscribe` and its siblings waited as long as it took: for another
+  goroutine opening or stopping the key, and for a delivery holding the
+  key's lock, which a `Block` subscriber can make last indefinitely. The
+  Context variants give up, returning the context's error, while they wait on
+  others. As with `net.DialContext`, the context bounds joining only: it has
+  no effect on a subscription once returned, and giving up never ends the
+  upstream for anyone else.
+
+  They cannot interrupt code that takes no context, such as the `Source` of
+  the key they are opening, so they let it return and then give back what
+  they took, the way a last subscriber leaving would. Callers waiting for a
+  held key's lock queue for it, and one goroutine per key waits on their
+  behalf, so callers that keep giving up on a stalled key cost it one
+  goroutine, not one each. On a key whose lock is free, a Context subscribe
+  costs what `Subscribe` does.
+
+- **`Hooks.Ended` and `Hooks.Evicted`** — `Stopped` reports the error of a
+  stop func, not why an upstream ended by itself, and `Dropped` reports
+  values a full queue lost, not subscribers `Evict` cut off. `Ended` is called
+  with the error an upstream ended with, always before `Stopped` reports the
+  same upstream; `Evicted` for each subscriber `Evict` cuts off, live or
+  catching up.
+
+### Fixed
+
+- **`Group.Close` could hang on a derived key.** A derived key's stop closes
+  its subscription to the key it is fed from, and so waits for that key's
+  delivery. If a `Block` subscriber there had stopped reading, only stopping
+  that key would have released it, and `Close` never got that far whenever it
+  came to the derived key first: 87 hangs in 100 in a reproduction. `Close`
+  now releases the waiting deliveries of every key it is about to stop, then
+  ends the subscribers of each key, one key not waiting on another's
+  delivery, then runs the stops one at a time. A `Block` subscriber released
+  this way is ended as soon as its own key's delivery lets go, never left
+  live and refused values for as long as other keys take.
+
+- **`SubscribeFunc(key, nil)` quietly made a sampler, and an unknown
+  `Overflow` quietly acted as `DropOldest`.** Both now panic where the mistake
+  is made, as a nil `Source` already does.
+
+### Performance
+
+- **Evicting many subscribers in one `Emit` is linear.** Each eviction used
+  to move every subscriber after it. One `Emit` evicting every subscriber:
+
+  | Subscribers | before | after |
+  |---:|---:|---:|
+  | 100 | 4.3 µs | 2.3 µs |
+  | 1000 | 76 µs | 22 µs |
+  | 10000 | 4.85 ms | 207 µs |
+
+- `Emit` to function subscribers is 3–12% faster. Joining and leaving a key
+  is 4–11 ns slower (5–9%), for the plumbing a Context subscribe needs.
+
+### Upgrading
+
+`go get github.com/heojeongbo/streamflight@v0.4.1`. Nothing to rewrite. Two
+things are worth a look:
+
+1. `SubscribeFunc` with a nil function, and `WithOverflow` with a value that
+   is not one of the four policies, now panic. The first used to make a
+   subscription that sampled instead of being called; the second used to act
+   as `DropOldest`.
+2. `Hooks.Joined` can now be followed by `Left` for a subscriber that never
+   got a subscription: one whose Context subscribe gave up waiting for the
+   key's lock. The counts stay balanced.
+
 ## v0.4.0 — 2026-09-26
 
 No new API. Two places where the package lost values without saying so, and
