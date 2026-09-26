@@ -3,6 +3,7 @@ package streamflight
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -59,8 +60,12 @@ func WithBuffer(n int) SubscribeOption {
 }
 
 // WithOverflow sets what a full queue does with an arriving value. The default
-// is DropOldest.
+// is DropOldest. It panics on a value that is not one of the four, rather than
+// let a mistyped policy lose values some other way than the one asked for.
 func WithOverflow(o Overflow) SubscribeOption {
+	if o < DropOldest || o > Evict {
+		panic(fmt.Sprintf("streamflight: WithOverflow with an unknown Overflow %d", int(o)))
+	}
 	return func(c subscribeConfig) subscribeConfig { c.overflow = o; return c }
 }
 
@@ -72,8 +77,9 @@ type Subscription[T any] struct {
 	// and receiving from it then blocks forever.
 	C <-chan T
 
-	fn       func(T)
-	ch       chan T
+	kind     kind
+	fn       func(T) // set for called
+	ch       chan T  // set for queued
 	overflow Overflow
 	owner    owner[T]
 
@@ -90,19 +96,31 @@ type Subscription[T any] struct {
 	closeErr  error
 }
 
+// kind is how a subscription receives its values. It is said once, by the
+// method that made the subscription, rather than read back from which of fn
+// and ch happen to be nil.
+type kind uint8
+
+const (
+	queued  kind = iota // Subscribe: values queue on ch
+	called              // SubscribeFunc: fn is called with each value
+	sampled             // SubscribeLatest: the key keeps its newest value
+)
+
 type owner[T any] interface {
 	leave(s *Subscription[T]) error
 	latest() (T, time.Time, bool)
 	latestAfter(t time.Time) (T, time.Time, bool, <-chan struct{})
 }
 
-func newSubscription[T any](fn func(T), ch chan T, overflow Overflow) *Subscription[T] {
+func newSubscription[T any](k kind, fn func(T), ch chan T, overflow Overflow) *Subscription[T] {
 	var closing chan struct{}
-	if fn == nil && overflow == Block {
+	if k == queued && overflow == Block {
 		closing = make(chan struct{})
 	}
 	return &Subscription[T]{
 		C:        ch,
+		kind:     k,
 		fn:       fn,
 		ch:       ch,
 		overflow: overflow,
@@ -155,7 +173,7 @@ func (s *Subscription[T]) Dropped() uint64 {
 // Err says whether this subscription is still live. It never sees the fresh
 // upstream that the key's next subscriber opens.
 func (s *Subscription[T]) Latest() (v T, at time.Time, ok bool) {
-	if s.fn != nil || s.ch != nil {
+	if s.kind != sampled {
 		panic("streamflight: Latest on a subscription that is delivered to")
 	}
 	return s.owner.latest()
@@ -189,7 +207,7 @@ func (s *Subscription[T]) Latest() (v T, at time.Time, ok bool) {
 // Like [Subscription.Latest] it is valid only on a subscription from
 // [Group.SubscribeLatest], and waits on nothing a delivery can hold.
 func (s *Subscription[T]) Wait(ctx context.Context, after time.Time) (v T, at time.Time, ok bool) {
-	if s.fn != nil || s.ch != nil {
+	if s.kind != sampled {
 		panic("streamflight: Wait on a subscription that is delivered to")
 	}
 	for {
@@ -230,7 +248,7 @@ func (s *Subscription[T]) Wait(ctx context.Context, after time.Time) (v T, at ti
 // Drain it again. It panics on a subscription that has no channel to drain,
 // which is any made by [Group.SubscribeFunc] or [Group.SubscribeLatest].
 func (s *Subscription[T]) Drain(ctx context.Context, send func(T) error) error {
-	if s.ch == nil {
+	if s.kind != queued {
 		panic("streamflight: Drain on a subscription with no channel")
 	}
 	for {
@@ -273,7 +291,7 @@ func (s *Subscription[T]) end(err error) {
 	// all. A reader selecting on both sees the end while values are still
 	// queued instead, and C goes on yielding them.
 	close(s.done)
-	if s.ch != nil {
+	if s.kind == queued {
 		close(s.ch)
 	}
 }

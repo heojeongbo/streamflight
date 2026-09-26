@@ -1225,6 +1225,25 @@ func TestMisuse(t *testing.T) {
 			g.SubscribeFunc("k", func(int) {})
 		})
 	})
+	t.Run("a nil function panics rather than sample instead", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		x.PanicsWithValue("streamflight: SubscribeFunc with a nil function", func() {
+			g.SubscribeFunc("k", nil)
+		})
+		x.Empty(r.Log(), "before anything was opened")
+	})
+	t.Run("an unknown Overflow panics rather than drop some other way", func(t *testing.T) {
+		x := require.New(t)
+		x.PanicsWithValue("streamflight: WithOverflow with an unknown Overflow 4", func() {
+			streamflight.WithOverflow(streamflight.Evict + 1)
+		})
+		x.PanicsWithValue("streamflight: WithOverflow with an unknown Overflow -1", func() {
+			streamflight.WithOverflow(-1)
+		})
+	})
 	t.Run("retaining the send of Initial panics", func(t *testing.T) {
 		x := require.New(t)
 		var escaped func(int)

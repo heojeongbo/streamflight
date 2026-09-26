@@ -175,7 +175,7 @@ func (g *Group[K, T]) Subscribe(key K, opts ...SubscribeOption) (*Subscription[T
 		c = opt(c)
 	}
 
-	s := newSubscription[T](nil, make(chan T, max(c.buffer, 1)), c.overflow)
+	s := newSubscription[T](queued, nil, make(chan T, max(c.buffer, 1)), c.overflow)
 	if err := g.subscribe(key, s); err != nil {
 		return nil, err
 	}
@@ -187,8 +187,12 @@ func (g *Group[K, T]) Subscribe(key K, opts ...SubscribeOption) (*Subscription[T
 // Replay and Initial have for it is delivered first, on the calling goroutine,
 // before SubscribeFunc returns: a fn that refers to the returned subscription
 // finds it nil for those. fn must not block; see the package documentation.
+// A nil fn panics.
 func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error) {
-	s := newSubscription[T](fn, nil, 0)
+	if fn == nil {
+		panic("streamflight: SubscribeFunc with a nil function")
+	}
+	s := newSubscription[T](called, fn, nil, 0)
 	if err := g.subscribe(key, s); err != nil {
 		return nil, err
 	}
@@ -215,7 +219,7 @@ func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error)
 // else opened starts with nothing until the next value: Replay keeps no
 // arrival times, so it cannot seed one.
 func (g *Group[K, T]) SubscribeLatest(key K) (*Subscription[T], error) {
-	s := newSubscription[T](nil, nil, 0)
+	s := newSubscription[T](sampled, nil, nil, 0)
 	if err := g.subscribe(key, s); err != nil {
 		return nil, err
 	}
@@ -315,7 +319,7 @@ func (g *Group[K, T]) subscribe(key K, s *Subscription[T]) error {
 		panic("streamflight: Group.Source is nil")
 	}
 
-	f, err := g.acquire(key, s.fn == nil && s.ch == nil)
+	f, err := g.acquire(key, s.kind == sampled)
 	if err != nil {
 		return err
 	}

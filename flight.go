@@ -210,7 +210,7 @@ func (f *flight[K, T]) attach(s *Subscription[T]) {
 		return
 	}
 
-	if s.fn == nil && s.ch == nil {
+	if s.kind == sampled {
 		// From here the key keeps its newest value. Not unset when this
 		// subscriber leaves: the next one would otherwise find nothing where
 		// the one before it was reading.
@@ -304,13 +304,13 @@ func (f *flight[K, T]) latestAfter(t time.Time) (T, time.Time, bool, <-chan stru
 
 // push delivers v to s under the given policy. f.mu must be held.
 func (f *flight[K, T]) push(s *Subscription[T], v T, policy Overflow) outcome {
-	if s.fn != nil {
+	switch s.kind {
+	case called:
 		s.fn(v)
 		return accepted
-	}
-	if s.ch == nil {
-		// A sampling subscriber. Emit already stored the value for the whole
-		// key, so there is nothing to hand this one.
+	case sampled:
+		// Emit already stored the value for the whole key, so there is
+		// nothing to hand this one.
 		return accepted
 	}
 
