@@ -7,6 +7,7 @@ import (
 	"io"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -128,6 +129,23 @@ func returns(t *testing.T, f func()) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("did not return: the Group is wedged")
+	}
+}
+
+// helping reports whether a goroutine is waiting for a key's lock on behalf of
+// a Context subscribe that found it held.
+func helping() bool {
+	buf := make([]byte, 1<<20)
+	return strings.Contains(string(buf[:runtime.Stack(buf, true)]), ").help(")
+}
+
+// eventually fails the test unless cond comes true within a few seconds.
+func eventually(t *testing.T, cond func() bool, what string) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !cond(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("never: " + what)
+		}
 	}
 }
 
@@ -2148,7 +2166,7 @@ func TestSubscribeContext(t *testing.T) {
 		x.Equal(1, <-stalled.C) // make room: the delivery ends
 		x.Equal(2, <-emitted)
 		x.Equal(2, <-stalled.C)
-		time.Sleep(10 * time.Millisecond) // and the lock it was waiting for is let go
+		eventually(t, func() bool { return !helping() }, "the lock it queued for is let go")
 		var n int
 		returns(t, func() { n = r.emit("k", 3) })
 		x.Equal(2, n, "nobody joined, and the key's lock is free")
@@ -2177,7 +2195,7 @@ func TestSubscribeContext(t *testing.T) {
 
 		joined := make(chan *streamflight.Subscription[int], 1)
 		go func() { joined <- must(g.SubscribeContext(t.Context(), "k", streamflight.WithBuffer(4))) }()
-		time.Sleep(10 * time.Millisecond)
+		eventually(t, helping, "it queues for the lock")
 		x.Equal(1, <-stalled.C)
 		s := <-joined
 		x.Equal(2, <-stalled.C) // room for the next
@@ -2187,6 +2205,58 @@ func TestSubscribeContext(t *testing.T) {
 		for _, s := range []*streamflight.Subscription[int]{first, stalled, s} {
 			x.NoError(s.Close())
 		}
+	})
+	t.Run("callers that keep giving up on a held key cost it one goroutine", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		reached := make(chan struct{})
+		first, err := g.SubscribeFunc("k", func(v int) {
+			if v == 2 {
+				close(reached)
+			}
+		})
+		x.NoError(err)
+		stalled, err := g.Subscribe("k", streamflight.WithOverflow(streamflight.Block))
+		x.NoError(err)
+		r.emit("k", 1)
+		emitted := make(chan int, 1)
+		go func() { emitted <- r.emit("k", 2) }()
+		<-reached // the delivery holds the key's lock until stalled reads
+
+		before := runtime.NumGoroutine()
+		for range 200 {
+			ctx, cancel := context.WithTimeout(t.Context(), 100*time.Microsecond)
+			_, err := g.SubscribeContext(ctx, "k")
+			cancel()
+			x.ErrorIs(err, context.DeadlineExceeded)
+		}
+		x.Less(runtime.NumGoroutine(), before+5, "one goroutine waits for the key, not one per caller")
+		x.True(helping())
+
+		x.Equal(1, <-stalled.C)
+		x.Equal(2, <-emitted)
+		x.Equal(2, <-stalled.C)
+		eventually(t, func() bool { return !helping() }, "it lets the key go once nobody waits")
+		var n int
+		returns(t, func() { n = r.emit("k", 3) })
+		x.Equal(2, n, "none of them joined")
+		x.NoError(first.Close())
+		x.NoError(stalled.Close())
+		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
+	t.Run("on a key whose lock is free it costs what Subscribe does", func(t *testing.T) {
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{Source: newRecorder().Source}
+		keep, err := g.SubscribeFunc("k", func(int) {})
+		x.NoError(err)
+		defer keep.Close()
+
+		ctx := t.Context()
+		plain := testing.AllocsPerRun(100, func() { must(g.Subscribe("k")).Close() })
+		withCtx := testing.AllocsPerRun(100, func() { must(g.SubscribeContext(ctx, "k")).Close() })
+		x.Equal(plain, withCtx, "no queue and no goroutine unless the lock is held")
 	})
 	t.Run("once it has returned, the context has no effect", func(t *testing.T) {
 		x := require.New(t)

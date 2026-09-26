@@ -2,6 +2,7 @@ package streamflight_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"hash/crc32"
 	"sync"
@@ -144,6 +145,14 @@ func BenchmarkSubscribe(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
 			must(g.Subscribe("k")).Close()
+		}
+	})
+	b.Run("chan, context", func(b *testing.B) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		b.ReportAllocs()
+		for b.Loop() {
+			must(g.SubscribeContext(ctx, "k")).Close()
 		}
 	})
 }

@@ -51,6 +51,13 @@ type flight[K comparable, T any] struct {
 	latestCh chan struct{} // closed and replaced whenever the value advances
 	wanted   bool          // guarded by mu, once f is published
 
+	// The callers of a Context subscribe that wait for mu while they can
+	// still give up, oldest first, and whether a goroutine is waiting for mu
+	// on their behalf. lockersMu is a leaf.
+	lockersMu sync.Mutex
+	lockers   []*locker
+	helping   bool
+
 	// mu guards the fields below and is held for every delivery.
 	mu     sync.Mutex
 	subs   []*Subscription[T]
@@ -59,6 +66,12 @@ type flight[K comparable, T any] struct {
 	count  int // how many values ring holds
 	done   bool
 	endErr error
+}
+
+// locker is a caller waiting for a flight's mu while it can still give up.
+type locker struct {
+	got    chan struct{} // mu is handed over by a send on it
+	gaveUp chan struct{} // closed once the caller has stopped waiting
 }
 
 type outcome int
@@ -294,25 +307,57 @@ func (f *flight[K, T]) lock(done <-chan struct{}) bool {
 	if f.mu.TryLock() {
 		return true
 	}
-	// Held by a delivery, which a Block subscriber can make last. Wait for it
-	// on a goroutine of its own, so that this one can give up. Whichever side
-	// does not end up with the lock is the one that lets it go, so it is
-	// never left held.
-	got, gaveUp := make(chan struct{}), make(chan struct{})
-	go func() {
-		f.mu.Lock()
-		select {
-		case got <- struct{}{}:
-		case <-gaveUp:
-			f.mu.Unlock()
-		}
-	}()
+	// Held by a delivery, which a Block subscriber can make last. Queue for
+	// it, and have one goroutine wait for it on behalf of everyone queued, so
+	// that this caller can give up, and callers that keep giving up on a key
+	// that stays held cost it one goroutine rather than one each.
+	l := &locker{got: make(chan struct{}), gaveUp: make(chan struct{})}
+	f.lockersMu.Lock()
+	f.lockers = append(f.lockers, l)
+	if !f.helping {
+		f.helping = true
+		go f.help()
+	}
+	f.lockersMu.Unlock()
+
 	select {
-	case <-got:
+	case <-l.got:
 		return true
 	case <-done:
-		close(gaveUp)
+		f.lockersMu.Lock()
+		if i := slices.Index(f.lockers, l); i >= 0 {
+			f.lockers = slices.Delete(f.lockers, i, i+1)
+		}
+		f.lockersMu.Unlock()
+		close(l.gaveUp) // in case help has already taken l off the queue
 		return false
+	}
+}
+
+// help waits for mu on behalf of the callers queued for it and hands it to
+// each in turn, by a send that only a caller still waiting can take: whoever
+// takes it lets it go. Once nobody is queued, help lets mu go and returns. At
+// most one runs per flight.
+func (f *flight[K, T]) help() {
+	f.mu.Lock()
+	for {
+		f.lockersMu.Lock()
+		if len(f.lockers) == 0 {
+			f.helping = false
+			f.lockersMu.Unlock()
+			f.mu.Unlock()
+			return
+		}
+		l := f.lockers[0]
+		f.lockers = slices.Delete(f.lockers, 0, 1)
+		f.lockersMu.Unlock()
+
+		select {
+		case l.got <- struct{}{}:
+			f.mu.Lock() // l has it now; wait for it again, for whoever is next
+		case <-l.gaveUp:
+			// l gave up as it was taken off the queue; mu is still ours.
+		}
 	}
 }
 
