@@ -1497,6 +1497,48 @@ func TestGroupClose(t *testing.T) {
 		x.NoError(<-first)
 		x.NoError(<-second)
 	})
+	t.Run("a stop that closes a subscription to a key with a stalled Block subscriber does not hang", func(t *testing.T) {
+		// derived is fed by a subscription to raw, which its stop closes. raw
+		// has a Block subscriber that stopped reading, so raw's delivery holds
+		// raw's lock. Stopping derived first used to wait on that lock, and
+		// only stopping raw would have released it.
+		for range 10 { // either key can come first
+			x := require.New(t)
+			var raw streamflight.Emitter[int]
+			reached := make(chan struct{})
+			g := &streamflight.Group[string, int]{}
+			g.Source = func(key string, e streamflight.Emitter[int]) (func() error, error) {
+				if key == "raw" {
+					raw = e
+					return nil, nil
+				}
+				sub, err := g.SubscribeFunc("raw", func(v int) { e.Emit(v) })
+				if err != nil {
+					return nil, err
+				}
+				return sub.Close, nil
+			}
+
+			d, err := g.SubscribeFunc("derived", func(v int) {
+				if v == 2 {
+					close(reached)
+				}
+			})
+			x.NoError(err)
+			stalled, err := g.Subscribe("raw", streamflight.WithOverflow(streamflight.Block))
+			x.NoError(err)
+			raw.Emit(1) // fills stalled's queue
+			go raw.Emit(2)
+			<-reached                         // derived has 2; stalled is next
+			time.Sleep(10 * time.Millisecond) // and raw's delivery waits on it
+
+			returns(t, func() { err = g.Close() })
+			x.NoError(err)
+			x.ErrorIs(stalled.Err(), streamflight.ErrGroupClosed)
+			x.NoError(d.Close())
+			x.NoError(stalled.Close())
+		}
+	})
 }
 
 // TestGroupIsolation pins that a delivery that stalls stalls only its own key.

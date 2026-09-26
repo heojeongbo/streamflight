@@ -273,6 +273,14 @@ func (g *Group[K, T]) closeAll() error {
 		}
 		g.mu.Unlock()
 
+		// In two steps, so that no key's stop waits on another's delivery:
+		// first release every delivery waiting on a Block subscriber of a key
+		// about to stop, then stop them. A stop func that closes a subscription
+		// to another key, as a derived stream's does, waits for that key's
+		// delivery, and only that key's own stop would release it otherwise.
+		for _, f := range doomed {
+			f.unblock()
+		}
 		errs = g.stopAll(doomed, errs)
 		if len(doomed) == 0 {
 			if w == nil {
