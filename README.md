@@ -50,8 +50,10 @@ Then subscribe. Which way depends on what is done with each value:
 ### Relaying to a client
 
 A handler that relays one key to one client is `Subscribe` and `Drain`, here
-`SubscribeContext`, so that a client that goes away while the key is still
-opening is not waited for:
+`SubscribeContext`, so that a client that goes away while another client is
+opening the key, or while a stalled delivery holds it, is not waited for. The
+client that opens the key still waits for its `Source`, which takes no
+context:
 
 ```go
 func (s *Server) Watch(req *Request, stream grpc.ServerStreamingServer[Status]) error {

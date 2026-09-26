@@ -150,10 +150,14 @@ type Hooks[K comparable, T any] struct {
 
 	// Joined is called when a subscriber joins key, with how many it has now.
 	// It is called before the subscriber is sent what Replay and Initial have
-	// for it, so it is not a sign that the subscriber can receive yet.
+	// for it, so it is not a sign that the subscriber can receive yet, nor
+	// that it will be subscribed at all: one whose Context subscribe gives up
+	// waiting for the key's lock, or whose catch-up panics, is reported by
+	// Left next, with no subscription to close.
 	Joined func(key K, n int)
 
-	// Left is called when a subscriber of key closes, with how many remain.
+	// Left is called when a subscriber of key closes, or leaves again without
+	// a subscription after Joined reported it, with how many remain.
 	Left func(key K, n int)
 
 	// Dropped is called with each value a subscriber of key loses to a full
@@ -188,17 +192,24 @@ func (g *Group[K, T]) Subscribe(key K, opts ...SubscribeOption) (*Subscription[T
 }
 
 // SubscribeContext is Subscribe, except that it gives up, returning ctx's
-// error, if ctx is done before the subscription has joined the key.
+// error, if ctx is done while it waits to join the key.
 //
 // It gives up while it waits on others: for another goroutine that is opening
 // or stopping the key, or for a delivery in progress, such as one a Block
-// subscriber holds up, to let it in. It cannot give up while it runs code that
-// takes no context: the Source and ReplayFor when it is the one opening the
-// key, and a stop func it runs itself. It lets those return, and then gives
-// back what it took, so that nothing it opened is left held. It gives an
-// upstream it opened back as a last subscriber leaving would: stopped at once,
-// or after [Group.Linger]. So without Linger, another subscriber that was
-// waiting on the same open may find it stopped, and open it afresh.
+// subscriber holds up, to let it take the key's lock. Callers waiting for that
+// lock queue for it, and one goroutine per key waits for it on their behalf
+// until it is free and nobody is queued.
+//
+// It cannot give up while it runs code that takes no context: the Source and
+// ReplayFor when it is the one opening the key, and a stop func it runs
+// itself. It lets those return, and then gives back what it took, the way a
+// last subscriber leaving would: stopped at once, or after [Group.Linger]. So
+// without Linger, another subscriber that was waiting on the same open may
+// find it stopped, and open it afresh. If the open it ran fails, or a Close
+// began while it ran, it returns that error instead, as Subscribe would. Nor
+// does it give up once it has the key's lock: from there it sends what Replay
+// and Initial have for it and joins, returning the subscription even if ctx is
+// done by then.
 //
 // ctx bounds joining and nothing else. Once SubscribeContext has returned a
 // subscription, ctx has no effect on it, and giving up never ends the upstream
@@ -232,7 +243,7 @@ func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error)
 }
 
 // SubscribeFuncContext is SubscribeFunc, giving up as [Group.SubscribeContext]
-// does if ctx is done before it has joined the key.
+// does if ctx is done while it waits to join the key.
 func (g *Group[K, T]) SubscribeFuncContext(ctx context.Context, key K, fn func(T)) (*Subscription[T], error) {
 	mustContext(ctx)
 	return g.subscribeCalled(ctx, key, fn)
@@ -273,7 +284,7 @@ func (g *Group[K, T]) SubscribeLatest(key K) (*Subscription[T], error) {
 }
 
 // SubscribeLatestContext is SubscribeLatest, giving up as
-// [Group.SubscribeContext] does if ctx is done before it has joined the key.
+// [Group.SubscribeContext] does if ctx is done while it waits to join the key.
 func (g *Group[K, T]) SubscribeLatestContext(ctx context.Context, key K) (*Subscription[T], error) {
 	mustContext(ctx)
 	return g.subscribeSampled(ctx, key)
@@ -409,9 +420,9 @@ func (g *Group[K, T]) subscribe(ctx context.Context, key K, s *Subscription[T]) 
 	}
 	s.owner = f
 	// attach runs the caller's code: Initial, a SubscribeFunc function being
-	// caught up, Hooks.Dropped. If that panics, or ctx is done first, the
-	// subscription is never returned, so give back the reference it would
-	// have held.
+	// caught up, Hooks.Dropped and Hooks.Evicted. If that panics, or ctx is
+	// done before attach has the key's lock, the subscription is never
+	// returned, so give back the reference it would have held.
 	attached := false
 	defer func() {
 		if !attached {

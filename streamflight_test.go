@@ -772,10 +772,13 @@ func TestSubscribeLatest(t *testing.T) {
 		ch, err := g.Subscribe("k")
 		x.NoError(err)
 		defer ch.Close()
+		fn, err := g.SubscribeFunc("k", func(int) {})
+		x.NoError(err)
+		defer fn.Close()
 
-		x.PanicsWithValue("streamflight: Wait on a subscription that is delivered to", func() {
-			ch.Wait(context.Background(), time.Time{})
-		})
+		const msg = "streamflight: Wait on a subscription that is delivered to"
+		x.PanicsWithValue(msg, func() { ch.Wait(context.Background(), time.Time{}) })
+		x.PanicsWithValue(msg, func() { fn.Wait(context.Background(), time.Time{}) })
 	})
 	t.Run("an open error is returned, as for any subscribe", func(t *testing.T) {
 		x := require.New(t)
@@ -2258,6 +2261,88 @@ func TestSubscribeContext(t *testing.T) {
 		withCtx := testing.AllocsPerRun(100, func() { must(g.SubscribeContext(ctx, "k")).Close() })
 		x.Equal(plain, withCtx, "no queue and no goroutine unless the lock is held")
 	})
+	t.Run("it gives up waiting for another goroutine's stop", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			gate := make(chan struct{})
+			opens := 0
+			g := &streamflight.Group[string, int]{
+				Source: func(string, streamflight.Emitter[int]) (func() error, error) {
+					opens++
+					return func() error { <-gate; return nil }, nil
+				},
+			}
+
+			s, err := g.Subscribe("k")
+			x.NoError(err)
+			go s.Close()
+			synctest.Wait() // the stop is running
+
+			ctx, cancel := context.WithCancel(t.Context())
+			gaveUp := make(chan error, 1)
+			go func() {
+				_, err := g.SubscribeContext(ctx, "k")
+				gaveUp <- err
+			}()
+			synctest.Wait()
+			x.Empty(gaveUp, "waiting for the stop")
+			cancel()
+			x.ErrorIs(<-gaveUp, context.Canceled, "before the stop returned")
+
+			close(gate)
+			synctest.Wait()
+			x.Equal(1, opens, "it opened nothing")
+		})
+	})
+	t.Run("it gives up after a stop it ran itself, rather than open afresh", func(t *testing.T) {
+		x := require.New(t)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		opens := 0
+		var e streamflight.Emitter[int]
+		g := &streamflight.Group[string, int]{
+			Source: func(_ string, e_ streamflight.Emitter[int]) (func() error, error) {
+				opens++
+				e = e_
+				return func() error {
+					cancel() // ctx ends while it runs this stop
+					return nil
+				}, nil
+			},
+		}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		e.End(nil) // it ended, and s still holds it: the next subscriber stops it
+		_, err = g.SubscribeContext(ctx, "k")
+		x.ErrorIs(err, context.Canceled)
+		x.Equal(1, opens)
+		x.NoError(s.Close())
+	})
+	t.Run("an open that fails as it gives up returns the open's error", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			boom := errors.New("boom")
+			gate := make(chan struct{})
+			g := &streamflight.Group[string, int]{
+				Source: func(string, streamflight.Emitter[int]) (func() error, error) {
+					<-gate
+					return nil, boom
+				},
+			}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			res := make(chan error, 1)
+			go func() {
+				_, err := g.SubscribeContext(ctx, "k")
+				res <- err
+			}()
+			synctest.Wait() // it is the one opening
+			cancel()
+			close(gate)
+			x.ErrorIs(<-res, boom, "as Subscribe would")
+		})
+	})
 	t.Run("once it has returned, the context has no effect", func(t *testing.T) {
 		x := require.New(t)
 		r := newRecorder()
@@ -2350,6 +2435,57 @@ func TestEndedAndEvicted(t *testing.T) {
 			"ended k EOF", "stopped k <nil>",
 			"stopped k <nil>",
 		}, log)
+	})
+	t.Run("Ended is not reported for an upstream the Group stops", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		var log []string
+		g := newGroup(r, &log)
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		x.NoError(g.Close())
+		r.emitter("k").End(nil) // too late: it was stopped
+		x.ErrorIs(s.Err(), streamflight.ErrGroupClosed)
+		x.Equal([]string{"stopped k <nil>"}, log)
+	})
+	t.Run("Ended comes before Stopped even when another goroutine stops it", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		var mu sync.Mutex
+		var log []string
+		inEnded, release := make(chan struct{}), make(chan struct{})
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Hooks: streamflight.Hooks[string, int]{
+				Ended: func(string, error) {
+					close(inEnded)
+					<-release
+					mu.Lock()
+					log = append(log, "ended")
+					mu.Unlock()
+				},
+				Stopped: func(string, error) {
+					mu.Lock()
+					log = append(log, "stopped")
+					mu.Unlock()
+				},
+			},
+		}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		go r.emitter("k").End(nil)
+		<-inEnded
+		closed := make(chan error, 1)
+		go func() { closed <- s.Close() }() // the last subscriber leaving stops it
+		time.Sleep(10 * time.Millisecond)
+		mu.Lock()
+		x.Empty(log, "the stop waits for Ended, which holds the key's lock")
+		mu.Unlock()
+		close(release)
+		x.NoError(<-closed)
+		x.Equal([]string{"ended", "stopped"}, log)
 	})
 }
 
@@ -2631,6 +2767,31 @@ func TestPanics(t *testing.T) {
 		x.Equal([]int{1, 3}, drain(keep.C), "2 never got past the panic")
 		x.NoError(a.Close())
 		x.NoError(keep.Close())
+	})
+	t.Run("an Evicted hook that panics as a catch-up is cut gives the reference back", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Replay: 2,
+			Hooks: streamflight.Hooks[string, int]{
+				Evicted: func(string) { panic(boom) },
+			},
+		}
+
+		keep, err := g.Subscribe("k", streamflight.WithBuffer(8))
+		x.NoError(err)
+		r.emit("k", 1, 2)
+		x.PanicsWithValue(boom, func() {
+			g.Subscribe("k", streamflight.WithOverflow(streamflight.Evict))
+		})
+
+		var n int
+		returns(t, func() { n = r.emit("k", 3) })
+		x.Equal(1, n, "the cut subscriber was never added")
+		x.Equal([]int{1, 2, 3}, drain(keep.C))
+		x.NoError(keep.Close())
+		x.Equal([]string{"open k", "stop k"}, r.Log(), "and its reference was given back")
 	})
 	t.Run("an Ended hook that panics fails the End, not the key", func(t *testing.T) {
 		x := require.New(t)
