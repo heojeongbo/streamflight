@@ -98,7 +98,8 @@
 //     and copy it before mutating.
 //   - Deliveries run while holding the key's lock, on the emitting goroutine or,
 //     for what a subscriber is sent as it joins, on the subscribing one.
-//     [Group.Initial], [Group.Now] and the Dropped hook run under that lock too.
+//     [Group.Initial], [Group.Now] and the Dropped, Evicted and Ended hooks run
+//     under that lock too.
 //     From there it is safe to read [Subscription.Latest], Err and Dropped,
 //     which never wait. A SubscribeFunc function or Initial may also Emit on
 //     another key, which is how a stream derived from this one is fed, unless
@@ -122,7 +123,7 @@
 //   - The Joined and Left hooks run under a lock shared by the whole Group, so
 //     that their counts are reported in order. Keep them short, and do not
 //     call back into the Group from any hook. Opened and Stopped run with no
-//     lock held, Dropped under the key's lock as a delivery does, and every
+//     lock held, Dropped, Evicted and Ended under the key's lock, and every
 //     hook may run concurrently for different keys.
 //   - Always Close a Subscription, including one that has already ended. An
 //     upstream is stopped when all of its subscriptions are closed (after
@@ -134,11 +135,12 @@
 //     call it ran in: the Group is not left locked, and nobody is left waiting
 //     on a key. A key whose Opened, Joined or Left hook panicked may go on
 //     running until its next subscriber leaves it (and then its Linger runs
-//     out) or the Group is closed, and
-//     whatever a Source or stop func had started and not stopped when it
-//     panicked, the Group never stops. On a goroutine the package starts there
-//     is no call to fail, and a panic crashes the program as on any goroutine:
-//     the timer that stops a key once its Linger runs out, which calls the
-//     stop func and the Stopped hook, and the one [Run] and [Poll] call their
-//     function on, unless that function recovers it.
+//     out) or the Group is closed, and whatever a Source or stop func had
+//     started and not stopped when it panicked, the Group never stops. On a
+//     goroutine the package starts there is no call to fail, and a panic
+//     crashes the program as on any goroutine: the timer that stops a key once
+//     its Linger runs out, which calls the stop func and the Stopped hook, and
+//     the one [Run] and [Poll] call their function on, unless that function
+//     recovers it. It cannot recover an Ended hook's, which runs as the
+//     function returns.
 package streamflight

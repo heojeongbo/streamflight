@@ -1955,6 +1955,75 @@ func TestHooks(t *testing.T) {
 	}, log)
 }
 
+func TestEndedAndEvicted(t *testing.T) {
+	// What Stopped and Dropped do not tell apart: an upstream that failed from
+	// one the Group stopped, and a subscriber cut off from a value refused.
+	newGroup := func(r *recorder, log *[]string) *streamflight.Group[string, int] {
+		return &streamflight.Group[string, int]{
+			Source: r.Source,
+			Replay: 3,
+			Hooks: streamflight.Hooks[string, int]{
+				Stopped: func(key string, err error) { *log = append(*log, fmt.Sprintf("stopped %s %v", key, err)) },
+				Dropped: func(key string, v int) { *log = append(*log, fmt.Sprintf("dropped %s %d", key, v)) },
+				Evicted: func(key string) { *log = append(*log, "evicted "+key) },
+				Ended:   func(key string, err error) { *log = append(*log, fmt.Sprintf("ended %s %v", key, err)) },
+			},
+		}
+	}
+
+	t.Run("Evicted reports each subscriber Evict cuts off, live or catching up", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		var log []string
+		g := newGroup(r, &log)
+
+		evict := streamflight.WithOverflow(streamflight.Evict)
+		a, err := g.Subscribe("k", evict)
+		x.NoError(err)
+		b, err := g.Subscribe("k", evict)
+		x.NoError(err)
+		r.emit("k", 1, 2)
+		x.Equal([]string{"evicted k", "evicted k"}, log, "and no Dropped for the value they had no room for")
+
+		late, err := g.Subscribe("k", evict)
+		x.NoError(err)
+		x.ErrorIs(late.Err(), streamflight.ErrEvicted)
+		x.Equal([]string{"evicted k", "evicted k", "evicted k"}, log, "the catch-up did not fit")
+
+		for _, s := range []*streamflight.Subscription[int]{a, b, late} {
+			x.NoError(s.Close())
+		}
+	})
+	t.Run("Ended reports an upstream that ends by itself, before Stopped", func(t *testing.T) {
+		x := require.New(t)
+		boom := errors.New("boom")
+		r := newRecorder()
+		var log []string
+		g := newGroup(r, &log)
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		r.emitter("k").End(boom)
+		x.NoError(s.Close())
+
+		s, err = g.Subscribe("k")
+		x.NoError(err)
+		r.emitter("k").End(nil)
+		x.NoError(s.Close())
+
+		s, err = g.Subscribe("k")
+		x.NoError(err)
+		x.NoError(s.Close())
+		r.emitter("k").End(boom) // after the Group stopped it: nothing to report
+
+		x.Equal([]string{
+			"ended k boom", "stopped k <nil>",
+			"ended k EOF", "stopped k <nil>",
+			"stopped k <nil>",
+		}, log)
+	})
+}
+
 func TestPanics(t *testing.T) {
 	// A panic in the caller's code fails the call it ran in. It must not leave
 	// the Group locked or anyone waiting on a key forever, and what the Source
@@ -2207,6 +2276,58 @@ func TestPanics(t *testing.T) {
 		v, _, ok := s.Latest()
 		x.True(ok)
 		x.Equal(2, v)
+		x.NoError(s.Close())
+	})
+	t.Run("an Evicted hook that panics fails the Emit, and the evicted stay out", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Hooks: streamflight.Hooks[string, int]{
+				Evicted: func(string) { panic(boom) },
+			},
+		}
+
+		a, err := g.Subscribe("k", streamflight.WithOverflow(streamflight.Evict))
+		x.NoError(err)
+		keep, err := g.Subscribe("k", streamflight.WithBuffer(8))
+		x.NoError(err)
+		r.emit("k", 1)
+		x.PanicsWithValue(boom, func() { r.emit("k", 2) })
+		x.ErrorIs(a.Err(), streamflight.ErrEvicted)
+
+		var n int
+		returns(t, func() { n = r.emit("k", 3) })
+		x.Equal(1, n, "a is gone, and nothing is sent to its closed queue")
+		x.Equal([]int{1, 3}, drain(keep.C), "2 never got past the panic")
+		x.NoError(a.Close())
+		x.NoError(keep.Close())
+	})
+	t.Run("an Ended hook that panics fails the End, not the key", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		var once atomic.Bool
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Hooks: streamflight.Hooks[string, int]{
+				Ended: func(string, error) {
+					if once.CompareAndSwap(false, true) {
+						panic(boom)
+					}
+				},
+			},
+		}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		x.PanicsWithValue(boom, func() { r.emitter("k").End(nil) })
+		x.ErrorIs(s.Err(), io.EOF, "it ended all the same")
+
+		var next *streamflight.Subscription[int]
+		returns(t, func() { next, err = g.Subscribe("k") })
+		x.NoError(err)
+		x.Equal([]string{"open k", "stop k", "open k"}, r.Log(), "a fresh upstream")
+		x.NoError(next.Close())
 		x.NoError(s.Close())
 	})
 	t.Run("a Stopped hook that panics in Close does not keep the rest from stopping", func(t *testing.T) {

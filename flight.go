@@ -154,7 +154,7 @@ func (f *flight[K, T]) evictFrom(i int, v T) (n int) {
 		clear(f.subs[kept+m:])
 		f.subs = f.subs[:kept+m]
 	}()
-	f.subs[i].end(ErrEvicted)
+	f.evict(f.subs[i])
 
 	for next < len(f.subs) {
 		s := f.subs[next]
@@ -162,7 +162,7 @@ func (f *flight[K, T]) evictFrom(i int, v T) (n int) {
 		next++
 		switch o {
 		case evicted:
-			s.end(ErrEvicted)
+			f.evict(s)
 			continue
 		case accepted:
 			n++
@@ -183,6 +183,11 @@ func (f *flight[K, T]) End(err error) {
 	defer f.mu.Unlock()
 	if !f.done {
 		f.finish(err)
+		// Under mu, so that it is reported before Stopped: stopping takes mu
+		// to see whether the flight has already ended.
+		if f.g.Hooks.Ended != nil {
+			f.g.Hooks.Ended(f.key, err)
+		}
 	}
 }
 
@@ -263,7 +268,7 @@ func (f *flight[K, T]) attach(s *Subscription[T]) {
 	}
 	if cut {
 		// Never added, so Close only has to give back its reference.
-		s.end(ErrEvicted)
+		f.evict(s)
 		return
 	}
 	f.subs = append(f.subs, s)
@@ -377,6 +382,16 @@ func (f *flight[K, T]) push(s *Subscription[T], v T, policy Overflow) outcome {
 		// subscriber, and only this goroutine sends to the queue.
 		s.ch <- v
 		return accepted
+	}
+}
+
+// evict ends s, which Evict has cut off, and reports it. s must already be out
+// of f.subs, or be about to be taken out even if the hook panics. f.mu must be
+// held.
+func (f *flight[K, T]) evict(s *Subscription[T]) {
+	s.end(ErrEvicted)
+	if f.g.Hooks.Evicted != nil {
+		f.g.Hooks.Evicted(f.key)
 	}
 }
 

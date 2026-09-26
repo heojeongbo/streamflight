@@ -126,17 +126,19 @@ type Group[K comparable, T any] struct {
 // Hooks observe a Group. Every field is optional. None may call back into the
 // Group, and all of them may be called concurrently for different keys. Joined
 // and Left run under a lock shared by the whole Group, so their counts arrive
-// in order; keep them short. Dropped runs under the key's lock, inside the
-// delivery that dropped the value.
+// in order; keep them short. Dropped and Evicted run under the key's lock,
+// inside the delivery that dropped the value or evicted the subscriber, and
+// Ended under it as the upstream ends.
 //
 // A hook that panics fails the call that reported it: the Group is not left
 // locked and nobody is left waiting on a key, but a key whose Opened, Joined
 // or Left panicked may go on running until its next subscriber leaves it (and
-// then its Linger runs out) or the Group is closed. A Stopped hook called when a key's Linger runs out runs
-// on a goroutine the package started, where there is no call to fail and a
-// panic crashes the program. A Dropped hook that panics fails the Emit that
-// reached it, which on the goroutine of a [Run] or [Poll] function crashes the
-// program unless that function recovers it.
+// then its Linger runs out) or the Group is closed. A Stopped hook called when
+// a key's Linger runs out, and an Ended hook called as a [Run] or [Poll]
+// function returns, run where there is no call of the caller's to fail, and a
+// panic crashes the program. A Dropped, Evicted or Ended hook reached from an
+// Emit or End the caller makes fails that call; on the goroutine of a Run or
+// Poll function, it crashes the program unless that function recovers it.
 type Hooks[K comparable, T any] struct {
 	// Opened is called after the Source of key was called, with its error.
 	Opened func(key K, err error)
@@ -160,6 +162,17 @@ type Hooks[K comparable, T any] struct {
 	// exception: under any policy but Evict, a queue too short for it displaces
 	// its oldest, as DropOldest does, and no Emit counted those.
 	Dropped func(key K, v T)
+
+	// Evicted is called for each subscriber of key that Evict cuts off, for
+	// falling behind or for a catch-up that did not fit its queue. Dropped is
+	// not called for the value it had no room for.
+	Evicted func(key K)
+
+	// Ended is called when the upstream of key ends by itself, through
+	// [Emitter.End], with the error its subscribers are closed with: io.EOF
+	// for End(nil). It is called before Stopped reports the same upstream, and
+	// not at all for one the Group stops.
+	Ended func(key K, err error)
 }
 
 // Subscribe joins key, opening its upstream if it has no subscriber, and

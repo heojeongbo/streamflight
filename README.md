@@ -229,7 +229,10 @@ opens a fresh upstream.
 it, such as a socket or a device, is a `Group[struct{}, T]` subscribed to with
 `struct{}{}`: the first subscriber opens it and the last one to leave stops it.
 
-**Observability.** `Group.Hooks` reports opens, stops, joins, leaves and drops.
+**Observability.** `Group.Hooks` reports opens, stops, joins, leaves and drops,
+subscribers `Evict` cut off, and upstreams that end by themselves (`Ended`), so
+a failing upstream can be told from a stopped one and a slow consumer from a
+refused value.
 
 ## Guarantees
 
@@ -258,14 +261,14 @@ it, such as a socket or a device, is a `Group[struct{}, T]` subscribed to with
 ## Rules
 
 - Every subscriber receives the **same** value. Treat it as read-only.
-- A `SubscribeFunc` function, `Initial`, `Now` and the `Dropped` hook run under
-  the key's lock, as a delivery. They may read `Latest`, `Err` and `Dropped`,
-  and a `SubscribeFunc` function or `Initial` may `Emit` on another key to feed
-  a stream derived from this one, unless what that key delivers leads back to
-  this one. They must not subscribe or `Close` a subscription on any key,
-  since either can run a `Source` or `stop` that needs this key, nor `Wait`,
-  `Emit` or `End` on the same key, or close the Group: each would wait on the
-  lock they hold.
+- A `SubscribeFunc` function, `Initial`, `Now` and the `Dropped`, `Evicted` and
+  `Ended` hooks run under the key's lock, as a delivery. They may read
+  `Latest`, `Err` and `Dropped`, and a `SubscribeFunc` function or `Initial`
+  may `Emit` on another key to feed a stream derived from this one, unless what
+  that key delivers leads back to this one. They must not subscribe or `Close`
+  a subscription on any key, since either can run a `Source` or `stop` that
+  needs this key, nor `Wait`, `Emit` or `End` on the same key, or close the
+  Group: each would wait on the lock they hold.
 - A `Source`, its `stop`, `ReplayFor` and any goroutine they own **may** use
   the Group: they can subscribe to other keys and close any subscription, which
   is what a stream derived from another one needs. They must not subscribe to
@@ -276,12 +279,13 @@ it, such as a socket or a device, is a `Group[struct{}, T]` subscribed to with
 - A panic in your code fails the call it ran in. The Group is not left locked
   and nobody is left waiting on a key. A key whose `Opened`, `Joined` or `Left`
   hook panicked may run until its next subscriber leaves (and then its `Linger`
-  runs out) or the Group is closed, and whatever a `Source` or `stop` had started and not stopped when it
-  panicked, the Group never stops. On a goroutine the package starts — the
-  timer that stops a key once its `Linger` runs out, which calls `stop` and
-  `Stopped`, or the one `Run` and `Poll` call their function on — there is no
-  call of yours to fail, and a panic crashes the program unless your function
-  recovers it.
+  runs out) or the Group is closed, and whatever a `Source` or `stop` had
+  started and not stopped when it panicked, the Group never stops. On a
+  goroutine the package starts — the timer that stops a key once its `Linger`
+  runs out, which calls `stop` and `Stopped`, or the one `Run` and `Poll` call
+  their function on — there is no call of yours to fail, and a panic crashes
+  the program unless your function recovers it. It cannot recover an `Ended`
+  hook's, which runs as the function returns.
 - Always `Close` a subscription, even one that has already ended.
 
 ## Performance
