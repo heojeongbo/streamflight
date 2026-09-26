@@ -1955,6 +1955,229 @@ func TestHooks(t *testing.T) {
 	}, log)
 }
 
+func TestSubscribeContext(t *testing.T) {
+	// gated is a Source that holds each open until its gate is closed.
+	gated := func(r *recorder) (streamflight.Source[string, int], chan struct{}) {
+		gate := make(chan struct{})
+		return func(key string, e streamflight.Emitter[int]) (func() error, error) {
+			<-gate
+			return r.Source(key, e)
+		}, gate
+	}
+
+	t.Run("a context already done opens nothing", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		_, err := g.SubscribeContext(ctx, "k")
+		x.ErrorIs(err, context.Canceled)
+		_, err = g.SubscribeFuncContext(ctx, "k", func(int) {})
+		x.ErrorIs(err, context.Canceled)
+		_, err = g.SubscribeLatestContext(ctx, "k")
+		x.ErrorIs(err, context.Canceled)
+		x.Empty(r.Log())
+	})
+	t.Run("it gives up waiting for another goroutine's open, which goes on", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			src, gate := gated(r)
+			joins := 0
+			g := &streamflight.Group[string, int]{
+				Source: src,
+				Hooks:  streamflight.Hooks[string, int]{Joined: func(string, int) { joins++ }},
+			}
+
+			opener := make(chan *streamflight.Subscription[int], 1)
+			go func() { opener <- must(g.Subscribe("k")) }()
+			synctest.Wait() // the opener is inside the Source
+
+			ctx, cancel := context.WithCancel(t.Context())
+			gaveUp := make(chan error, 1)
+			go func() {
+				_, err := g.SubscribeFuncContext(ctx, "k", func(int) {})
+				gaveUp <- err
+			}()
+			synctest.Wait()
+			cancel()
+			x.ErrorIs(<-gaveUp, context.Canceled, "without waiting for the Source")
+
+			close(gate)
+			s := <-opener
+			x.Equal(1, joins, "only the opener joined")
+			x.NoError(s.Close())
+			x.Equal([]string{"open k", "stop k"}, r.Log())
+		})
+	})
+	t.Run("the opener that gives up during its Source gives back what it opened", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			src, gate := gated(r)
+			// It gives it back as a last subscriber leaving would. With Linger,
+			// the subscriber that was waiting on the same open finds it still
+			// running; without, it may find it stopped and open it afresh.
+			g := &streamflight.Group[string, int]{Source: src, Linger: time.Hour}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			gaveUp := make(chan error, 1)
+			go func() {
+				_, err := g.SubscribeLatestContext(ctx, "k")
+				gaveUp <- err
+			}()
+			synctest.Wait() // inside the Source, which takes no context
+			waiter := make(chan *streamflight.Subscription[int], 1)
+			go func() { waiter <- must(g.Subscribe("k")) }()
+			synctest.Wait()
+
+			cancel()
+			synctest.Wait()
+			x.Empty(gaveUp, "still in the Source")
+			close(gate)
+			x.ErrorIs(<-gaveUp, context.Canceled, "once the Source returned")
+
+			s := <-waiter
+			x.Equal([]string{"open k"}, r.Log(), "the waiter keeps what was opened")
+			x.NoError(s.Close())
+			time.Sleep(time.Hour)
+			synctest.Wait()
+			x.Equal([]string{"open k", "stop k"}, r.Log(), "and nothing is left held")
+		})
+	})
+	t.Run("without Linger, an opener that gives up leaves nothing held either", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			r := newRecorder()
+			src, gate := gated(r)
+			g := &streamflight.Group[string, int]{Source: src}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			gaveUp := make(chan error, 1)
+			go func() {
+				_, err := g.SubscribeContext(ctx, "k")
+				gaveUp <- err
+			}()
+			synctest.Wait()
+			waiter := make(chan *streamflight.Subscription[int], 1)
+			go func() { waiter <- must(g.Subscribe("k", streamflight.WithBuffer(4))) }()
+			synctest.Wait()
+
+			cancel()
+			close(gate)
+			x.ErrorIs(<-gaveUp, context.Canceled)
+			s := <-waiter
+			r.emitter("k").Emit(1)
+			x.Equal(1, <-s.C, "the waiter has a working subscription, whichever upstream it is")
+			x.NoError(s.Close())
+
+			opens, stops := 0, 0
+			for _, l := range r.Log() {
+				if l == "open k" {
+					opens++
+				} else {
+					stops++
+				}
+			}
+			x.Equal(opens, stops, "every upstream opened was stopped")
+		})
+	})
+	t.Run("it gives up waiting on a delivery a Block subscriber holds up", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		reached := make(chan struct{})
+		first, err := g.SubscribeFunc("k", func(v int) {
+			if v == 2 {
+				close(reached)
+			}
+		})
+		x.NoError(err)
+		stalled, err := g.Subscribe("k", streamflight.WithOverflow(streamflight.Block))
+		x.NoError(err)
+		r.emit("k", 1)
+		emitted := make(chan int, 1)
+		go func() { emitted <- r.emit("k", 2) }()
+		<-reached
+		time.Sleep(10 * time.Millisecond) // the delivery now waits on stalled
+
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+		_, err = g.SubscribeContext(ctx, "k")
+		x.ErrorIs(err, context.DeadlineExceeded)
+
+		x.Equal(1, <-stalled.C) // make room: the delivery ends
+		x.Equal(2, <-emitted)
+		x.Equal(2, <-stalled.C)
+		time.Sleep(10 * time.Millisecond) // and the lock it was waiting for is let go
+		var n int
+		returns(t, func() { n = r.emit("k", 3) })
+		x.Equal(2, n, "nobody joined, and the key's lock is free")
+		x.NoError(first.Close())
+		x.NoError(stalled.Close())
+		x.Equal([]string{"open k", "stop k"}, r.Log(), "its reference was given back")
+	})
+	t.Run("it joins once the delivery it waited on is done", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		reached := make(chan struct{})
+		first, err := g.SubscribeFunc("k", func(v int) {
+			if v == 2 {
+				close(reached)
+			}
+		})
+		x.NoError(err)
+		stalled, err := g.Subscribe("k", streamflight.WithOverflow(streamflight.Block))
+		x.NoError(err)
+		r.emit("k", 1)
+		go r.emit("k", 2)
+		<-reached
+		time.Sleep(10 * time.Millisecond)
+
+		joined := make(chan *streamflight.Subscription[int], 1)
+		go func() { joined <- must(g.SubscribeContext(t.Context(), "k", streamflight.WithBuffer(4))) }()
+		time.Sleep(10 * time.Millisecond)
+		x.Equal(1, <-stalled.C)
+		s := <-joined
+		x.Equal(2, <-stalled.C) // room for the next
+		r.emit("k", 3)
+		x.Equal(3, <-s.C)
+
+		for _, s := range []*streamflight.Subscription[int]{first, stalled, s} {
+			x.NoError(s.Close())
+		}
+	})
+	t.Run("once it has returned, the context has no effect", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		s, err := g.SubscribeContext(ctx, "k", streamflight.WithBuffer(4))
+		x.NoError(err)
+		cancel()
+		r.emit("k", 1)
+		x.Equal(1, <-s.C)
+		x.NoError(s.Err())
+		x.NoError(s.Close())
+	})
+	t.Run("a nil context panics", func(t *testing.T) {
+		x := require.New(t)
+		g := &streamflight.Group[string, int]{Source: newRecorder().Source}
+		var nilCtx context.Context
+
+		const msg = "streamflight: nil Context"
+		x.PanicsWithValue(msg, func() { g.SubscribeContext(nilCtx, "k") })
+		x.PanicsWithValue(msg, func() { g.SubscribeFuncContext(nilCtx, "k", func(int) {}) })
+		x.PanicsWithValue(msg, func() { g.SubscribeLatestContext(nilCtx, "k") })
+	})
+}
+
 func TestEndedAndEvicted(t *testing.T) {
 	// What Stopped and Dropped do not tell apart: an upstream that failed from
 	// one the Group stopped, and a subscriber cut off from a value refused.

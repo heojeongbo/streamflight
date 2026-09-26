@@ -234,14 +234,18 @@ func (f *flight[K, T]) finish(err error) {
 	f.count = 0
 }
 
-// attach adds s, first sending it what Replay and Initial have for it.
-func (f *flight[K, T]) attach(s *Subscription[T]) {
-	f.mu.Lock()
+// attach adds s, first sending it what Replay and Initial have for it. It
+// reports false, having done nothing, if done is closed before it has the
+// key's lock.
+func (f *flight[K, T]) attach(done <-chan struct{}, s *Subscription[T]) bool {
+	if !f.lock(done) {
+		return false
+	}
 	defer f.mu.Unlock()
 
 	if f.done {
 		s.end(f.endErr)
-		return
+		return true
 	}
 
 	if s.kind == sampled {
@@ -269,9 +273,47 @@ func (f *flight[K, T]) attach(s *Subscription[T]) {
 	if cut {
 		// Never added, so Close only has to give back its reference.
 		f.evict(s)
-		return
+		return true
 	}
 	f.subs = append(f.subs, s)
+	return true
+}
+
+// lock takes mu, unless done is closed first; it reports whether it did. With
+// a nil done it is mu.Lock.
+func (f *flight[K, T]) lock(done <-chan struct{}) bool {
+	if done == nil {
+		f.mu.Lock()
+		return true
+	}
+	select {
+	case <-done:
+		return false
+	default:
+	}
+	if f.mu.TryLock() {
+		return true
+	}
+	// Held by a delivery, which a Block subscriber can make last. Wait for it
+	// on a goroutine of its own, so that this one can give up. Whichever side
+	// does not end up with the lock is the one that lets it go, so it is
+	// never left held.
+	got, gaveUp := make(chan struct{}), make(chan struct{})
+	go func() {
+		f.mu.Lock()
+		select {
+		case got <- struct{}{}:
+		case <-gaveUp:
+			f.mu.Unlock()
+		}
+	}()
+	select {
+	case <-got:
+		return true
+	case <-done:
+		close(gaveUp)
+		return false
+	}
 }
 
 // initial sends s what Initial has for it, and reports whether that cut s off.

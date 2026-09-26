@@ -1,6 +1,7 @@
 package streamflight
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
@@ -183,13 +184,38 @@ type Hooks[K comparable, T any] struct {
 // events, which want [WithBuffer] and perhaps another [Overflow]. Relaying the
 // values to a client is [Subscription.Drain].
 func (g *Group[K, T]) Subscribe(key K, opts ...SubscribeOption) (*Subscription[T], error) {
+	return g.subscribeQueued(nil, key, opts)
+}
+
+// SubscribeContext is Subscribe, except that it gives up, returning ctx's
+// error, if ctx is done before the subscription has joined the key.
+//
+// It gives up while it waits on others: for another goroutine that is opening
+// or stopping the key, or for a delivery in progress, such as one a Block
+// subscriber holds up, to let it in. It cannot give up while it runs code that
+// takes no context: the Source and ReplayFor when it is the one opening the
+// key, and a stop func it runs itself. It lets those return, and then gives
+// back what it took, so that nothing it opened is left held. It gives an
+// upstream it opened back as a last subscriber leaving would: stopped at once,
+// or after [Group.Linger]. So without Linger, another subscriber that was
+// waiting on the same open may find it stopped, and open it afresh.
+//
+// ctx bounds joining and nothing else. Once SubscribeContext has returned a
+// subscription, ctx has no effect on it, and giving up never ends the upstream
+// for anyone else subscribed to the key. It panics on a nil ctx.
+func (g *Group[K, T]) SubscribeContext(ctx context.Context, key K, opts ...SubscribeOption) (*Subscription[T], error) {
+	mustContext(ctx)
+	return g.subscribeQueued(ctx, key, opts)
+}
+
+func (g *Group[K, T]) subscribeQueued(ctx context.Context, key K, opts []SubscribeOption) (*Subscription[T], error) {
 	c := subscribeConfig{buffer: 1}
 	for _, opt := range opts {
 		c = opt(c)
 	}
 
 	s := newSubscription[T](queued, nil, make(chan T, max(c.buffer, 1)), c.overflow)
-	if err := g.subscribe(key, s); err != nil {
+	if err := g.subscribe(ctx, key, s); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -202,11 +228,22 @@ func (g *Group[K, T]) Subscribe(key K, opts ...SubscribeOption) (*Subscription[T
 // finds it nil for those. fn must not block; see the package documentation.
 // A nil fn panics.
 func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error) {
+	return g.subscribeCalled(nil, key, fn)
+}
+
+// SubscribeFuncContext is SubscribeFunc, giving up as [Group.SubscribeContext]
+// does if ctx is done before it has joined the key.
+func (g *Group[K, T]) SubscribeFuncContext(ctx context.Context, key K, fn func(T)) (*Subscription[T], error) {
+	mustContext(ctx)
+	return g.subscribeCalled(ctx, key, fn)
+}
+
+func (g *Group[K, T]) subscribeCalled(ctx context.Context, key K, fn func(T)) (*Subscription[T], error) {
 	if fn == nil {
 		panic("streamflight: SubscribeFunc with a nil function")
 	}
 	s := newSubscription[T](called, fn, nil, 0)
-	if err := g.subscribe(key, s); err != nil {
+	if err := g.subscribe(ctx, key, s); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -232,11 +269,28 @@ func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error)
 // else opened starts with nothing until the next value: Replay keeps no
 // arrival times, so it cannot seed one.
 func (g *Group[K, T]) SubscribeLatest(key K) (*Subscription[T], error) {
+	return g.subscribeSampled(nil, key)
+}
+
+// SubscribeLatestContext is SubscribeLatest, giving up as
+// [Group.SubscribeContext] does if ctx is done before it has joined the key.
+func (g *Group[K, T]) SubscribeLatestContext(ctx context.Context, key K) (*Subscription[T], error) {
+	mustContext(ctx)
+	return g.subscribeSampled(ctx, key)
+}
+
+func (g *Group[K, T]) subscribeSampled(ctx context.Context, key K) (*Subscription[T], error) {
 	s := newSubscription[T](sampled, nil, nil, 0)
-	if err := g.subscribe(key, s); err != nil {
+	if err := g.subscribe(ctx, key, s); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+func mustContext(ctx context.Context) {
+	if ctx == nil {
+		panic("streamflight: nil Context")
+	}
 }
 
 // Close stops every upstream, ends every subscription with ErrGroupClosed and
@@ -327,35 +381,52 @@ func (g *Group[K, T]) stopAll(doomed []*flight[K, T], errs []error) []error {
 	return errs
 }
 
-func (g *Group[K, T]) subscribe(key K, s *Subscription[T]) error {
+// subscribe joins s to key. ctx is nil for the methods that take none, which
+// then wait as long as it takes.
+func (g *Group[K, T]) subscribe(ctx context.Context, key K, s *Subscription[T]) error {
 	if g.Source == nil {
 		panic("streamflight: Group.Source is nil")
 	}
+	var done <-chan struct{}
+	if ctx != nil {
+		done = ctx.Done() // nil for a context that is never done
+	}
 
-	f, err := g.acquire(key, s.kind == sampled)
+	f, err := g.acquire(ctx, done, key, s.kind == sampled)
 	if err != nil {
 		return err
 	}
 	s.owner = f
 	// attach runs the caller's code: Initial, a SubscribeFunc function being
-	// caught up, Hooks.Dropped. If that panics, the subscription is never
-	// returned, so give back the reference it would have held.
+	// caught up, Hooks.Dropped. If that panics, or ctx is done first, the
+	// subscription is never returned, so give back the reference it would
+	// have held.
 	attached := false
 	defer func() {
 		if !attached {
 			_ = g.release(f)
 		}
 	}()
-	f.attach(s)
+	if !f.attach(done, s) {
+		return ctx.Err()
+	}
 	attached = true
 	return nil
 }
 
 // acquire returns the upstream of key with one more reference, opening it if
-// key has none and waiting if another goroutine is opening or stopping it.
-// sampler says whether the caller samples rather than being delivered to.
-func (g *Group[K, T]) acquire(key K, sampler bool) (*flight[K, T], error) {
+// key has none and waiting if another goroutine is opening or stopping it,
+// unless done is closed first. sampler says whether the caller samples rather
+// than being delivered to.
+func (g *Group[K, T]) acquire(ctx context.Context, done <-chan struct{}, key K, sampler bool) (*flight[K, T], error) {
 	for {
+		if done != nil {
+			select {
+			case <-done:
+				return nil, ctx.Err()
+			default:
+			}
+		}
 		g.mu.Lock()
 		// Re-checked every time round, so a waiter woken by Close never parks
 		// again.
@@ -394,7 +465,11 @@ func (g *Group[K, T]) acquire(key K, sampler bool) (*flight[K, T], error) {
 			// again: the key may be free, or held by a fresh upstream.
 			w := f.waitLocked()
 			g.mu.Unlock()
-			<-w
+			select {
+			case <-w:
+			case <-done:
+				return nil, ctx.Err() // nothing taken yet
+			}
 			if err := f.openErr; err != nil {
 				// Its open failed. Share the error rather than pile a second
 				// attempt onto whatever made the first one fail.

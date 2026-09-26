@@ -49,11 +49,13 @@ Then subscribe. Which way depends on what is done with each value:
 
 ### Relaying to a client
 
-A handler that relays one key to one client is `Subscribe` and `Drain`:
+A handler that relays one key to one client is `Subscribe` and `Drain`, here
+`SubscribeContext`, so that a client that goes away while the key is still
+opening is not waited for:
 
 ```go
 func (s *Server) Watch(req *Request, stream grpc.ServerStreamingServer[Status]) error {
-	sub, err := s.group.Subscribe(req.Key, streamflight.WithBuffer(16))
+	sub, err := s.group.SubscribeContext(stream.Context(), req.Key, streamflight.WithBuffer(16))
 	if err != nil {
 		return err
 	}
