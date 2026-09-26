@@ -129,17 +129,46 @@ func (f *flight[K, T]) Emit(v T) int {
 	}
 
 	n := 0
-	for i := 0; i < len(f.subs); {
-		s := f.subs[i]
+	for i, s := range f.subs {
 		switch f.push(s, v, s.overflow) {
 		case accepted:
 			n++
 		case evicted:
-			f.subs = slices.Delete(f.subs, i, i+1)
+			return n + f.evictFrom(i, v)
+		}
+	}
+	return n
+}
+
+// evictFrom takes out f.subs[i], which delivering v has just evicted, and
+// delivers v to the subscribers after it, taking out any others it evicts on
+// the way. One pass moves each subscriber that stays once, however many go,
+// where taking each out in place would move all those after it every time. A
+// delivery that panics still leaves f.subs whole: those it had not reached
+// stay, as they would have without it. It returns how many accepted v. f.mu
+// must be held.
+func (f *flight[K, T]) evictFrom(i int, v T) (n int) {
+	kept, next := i, i+1 // f.subs[:kept] stay; f.subs[next:] are not reached yet
+	defer func() {
+		m := copy(f.subs[kept:], f.subs[next:])
+		clear(f.subs[kept+m:])
+		f.subs = f.subs[:kept+m]
+	}()
+	f.subs[i].end(ErrEvicted)
+
+	for next < len(f.subs) {
+		s := f.subs[next]
+		o := f.push(s, v, s.overflow) // a panic here leaves s among those not reached
+		next++
+		switch o {
+		case evicted:
 			s.end(ErrEvicted)
 			continue
+		case accepted:
+			n++
 		}
-		i++
+		f.subs[kept] = s
+		kept++
 	}
 	return n
 }

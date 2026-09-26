@@ -324,3 +324,37 @@ func BenchmarkSharedVsDedicated(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkEvictAll is one Emit that evicts every subscriber of a key at once,
+// the worst case for taking them out of the key's list.
+func BenchmarkEvictAll(b *testing.B) {
+	for _, n := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprintf("subscribers=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				b.StopTimer()
+				var e streamflight.Emitter[int]
+				var subs []*streamflight.Subscription[int]
+				g := &streamflight.Group[string, int]{
+					Source: func(_ string, e_ streamflight.Emitter[int]) (func() error, error) {
+						e = e_
+						return nil, nil
+					},
+				}
+				for range n {
+					subs = append(subs, must(g.Subscribe("k", streamflight.WithOverflow(streamflight.Evict))))
+				}
+				e.Emit(0) // every queue is full
+				b.StartTimer()
+
+				e.Emit(1) // and every subscriber is evicted
+
+				b.StopTimer()
+				for _, s := range subs {
+					s.Close()
+				}
+				b.StartTimer()
+			}
+		})
+	}
+}

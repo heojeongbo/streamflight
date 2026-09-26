@@ -854,6 +854,82 @@ func TestOverflow(t *testing.T) {
 		x.ErrorIs(slow.Err(), streamflight.ErrEvicted, "close does not rewrite why it ended")
 		x.Equal([]string{"open k", "stop k"}, r.Log())
 	})
+	t.Run("one Emit that evicts several keeps the rest, in order", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		var got []string
+		sub := func(name string, opts ...streamflight.SubscribeOption) *streamflight.Subscription[int] {
+			if opts == nil {
+				s, err := g.SubscribeFunc("k", func(v int) { got = append(got, fmt.Sprint(name, v)) })
+				x.NoError(err)
+				return s
+			}
+			s, err := g.Subscribe("k", opts...)
+			x.NoError(err)
+			return s
+		}
+		evict := streamflight.WithOverflow(streamflight.Evict)
+		a := sub("a", evict)
+		f1 := sub("f1")
+		b := sub("b", evict)
+		refuse := sub("refuse", streamflight.WithOverflow(streamflight.DropNewest))
+		c := sub("c", evict)
+		f2 := sub("f2")
+
+		x.Equal(6, r.emit("k", 1), "every queue takes one")
+		x.Equal(2, r.emit("k", 2), "a, b and c are evicted, refuse refuses, f1 and f2 take it")
+		for _, s := range []*streamflight.Subscription[int]{a, b, c} {
+			x.ErrorIs(s.Err(), streamflight.ErrEvicted)
+		}
+		x.Equal(2, r.emit("k", 3), "refuse is still full; the evicted are gone")
+		x.Equal([]string{"f11", "f21", "f12", "f22", "f13", "f23"}, got, "the ones that stayed, in their order")
+		x.Equal([]int{1}, drain(refuse.C))
+		x.Equal(uint64(2), refuse.Dropped())
+
+		for _, s := range []*streamflight.Subscription[int]{a, f1, b, refuse, c, f2} {
+			x.NoError(s.Close())
+		}
+		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
+	t.Run("a delivery that panics after an eviction leaves the subscribers whole", func(t *testing.T) {
+		const boom = "boom"
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		evict := streamflight.WithOverflow(streamflight.Evict)
+		a, err := g.Subscribe("k", evict)
+		x.NoError(err)
+		var fn collector
+		f, err := g.SubscribeFunc("k", func(v int) {
+			if v == 2 {
+				panic(boom)
+			}
+			fn.Add(v)
+		})
+		x.NoError(err)
+		b, err := g.Subscribe("k", evict)
+		x.NoError(err)
+		keep, err := g.Subscribe("k", streamflight.WithBuffer(8))
+		x.NoError(err)
+
+		r.emit("k", 1)
+		x.PanicsWithValue(boom, func() { r.emit("k", 2) }, "a was evicted, then the function panicked")
+		x.ErrorIs(a.Err(), streamflight.ErrEvicted)
+		x.NoError(b.Err(), "not reached, so kept")
+
+		x.Equal(2, r.emit("k", 3), "no send to a's closed queue; b is evicted now")
+		x.ErrorIs(b.Err(), streamflight.ErrEvicted)
+		x.Equal([]int{1, 3}, fn.Values())
+		x.Equal([]int{1, 3}, drain(keep.C))
+
+		for _, s := range []*streamflight.Subscription[int]{a, f, b, keep} {
+			x.NoError(s.Close())
+		}
+		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
 	t.Run("Evict ends a subscriber whose catch-up does not fit its queue", func(t *testing.T) {
 		x := require.New(t)
 		r := newRecorder()
