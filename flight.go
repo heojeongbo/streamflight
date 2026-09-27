@@ -20,12 +20,15 @@ type flight[K comparable, T any] struct {
 	quit     chan struct{}
 	quitOnce sync.Once
 
-	// Guarded by g.mu.
-	refs  int
-	gen   uint64 // bumped whenever a linger timer is armed or disarmed
-	timer *time.Timer
-	st    state
-	wait  chan struct{} // closed when f leaves the phase it is in
+	// Guarded by g.mu. pending counts the callers waiting for f to finish
+	// opening so as to join it: while any are, f is not stopped for having no
+	// subscriber, since one is about to arrive.
+	refs    int
+	pending int
+	gen     uint64 // bumped whenever a linger timer is armed or disarmed
+	timer   *time.Timer
+	st      state
+	wait    chan struct{} // closed when f leaves the phase it is in
 
 	// openErr is why this flight never opened. Written under g.mu before wait
 	// is closed, and read only after receiving from it.
@@ -53,10 +56,11 @@ type flight[K comparable, T any] struct {
 
 	// The callers of a Context subscribe that wait for mu while they can
 	// still give up, oldest first, and whether a goroutine is waiting for mu
-	// on their behalf. lockersMu is a leaf.
-	lockersMu sync.Mutex
-	lockers   []*locker
-	helping   bool
+	// on their behalf. A list, so that a caller leaves it and help takes the
+	// next in constant time however many are queued. lockersMu is a leaf.
+	lockersMu   sync.Mutex
+	first, last *locker
+	helping     bool
 
 	// mu guards the fields below and is held for every delivery.
 	mu     sync.Mutex
@@ -70,8 +74,39 @@ type flight[K comparable, T any] struct {
 
 // locker is a caller waiting for a flight's mu while it can still give up.
 type locker struct {
-	got    chan struct{} // mu is handed over by a send on it
-	gaveUp chan struct{} // closed once the caller has stopped waiting
+	got        chan struct{} // mu is handed over by a send on it
+	gaveUp     chan struct{} // closed once the caller has stopped waiting
+	prev, next *locker       // its neighbours while queued; guarded by lockersMu
+	queued     bool
+}
+
+// enqueue adds l at the back of the queue. f.lockersMu must be held.
+func (f *flight[K, T]) enqueue(l *locker) {
+	l.prev, l.queued = f.last, true
+	if f.last != nil {
+		f.last.next = l
+	} else {
+		f.first = l
+	}
+	f.last = l
+}
+
+// dequeue takes l out of the queue, if it is still in it: a caller giving up
+// may find help has taken it out already. f.lockersMu must be held.
+func (f *flight[K, T]) dequeue(l *locker) {
+	if l.queued {
+		if l.prev != nil {
+			l.prev.next = l.next
+		} else {
+			f.first = l.next
+		}
+		if l.next != nil {
+			l.next.prev = l.prev
+		} else {
+			f.last = l.prev
+		}
+		l.prev, l.next, l.queued = nil, nil, false
+	}
 }
 
 type outcome int
@@ -190,7 +225,15 @@ func (f *flight[K, T]) End(err error) {
 	if err == nil {
 		err = io.EOF
 	}
-	f.unblock()
+	// Ended by itself only if nothing was stopping it yet: once a stop has
+	// begun, as Close's begins for every key before ending any, an upstream
+	// that ends in reply, such as one fed by a key Close ended first, is the
+	// Group stopping it.
+	first := false
+	f.quitOnce.Do(func() {
+		first = true
+		close(f.quit)
+	})
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -198,7 +241,7 @@ func (f *flight[K, T]) End(err error) {
 		f.finish(err)
 		// Under mu, so that it is reported before Stopped: stopping takes mu
 		// to see whether the flight has already ended.
-		if f.g.Hooks.Ended != nil {
+		if first && f.g.Hooks.Ended != nil {
 			f.g.Hooks.Ended(f.key, err)
 		}
 	}
@@ -322,7 +365,7 @@ func (f *flight[K, T]) lock(done <-chan struct{}) bool {
 	// that stays held cost it one goroutine rather than one each.
 	l := &locker{got: make(chan struct{}), gaveUp: make(chan struct{})}
 	f.lockersMu.Lock()
-	f.lockers = append(f.lockers, l)
+	f.enqueue(l)
 	if !f.helping {
 		f.helping = true
 		go f.help()
@@ -334,9 +377,7 @@ func (f *flight[K, T]) lock(done <-chan struct{}) bool {
 		return true
 	case <-done:
 		f.lockersMu.Lock()
-		if i := slices.Index(f.lockers, l); i >= 0 {
-			f.lockers = slices.Delete(f.lockers, i, i+1)
-		}
+		f.dequeue(l)
 		f.lockersMu.Unlock()
 		close(l.gaveUp) // in case help has already taken l off the queue
 		return false
@@ -352,14 +393,14 @@ func (f *flight[K, T]) help() {
 	f.mu.Lock()
 	for {
 		f.lockersMu.Lock()
-		if len(f.lockers) == 0 {
+		l := f.first
+		if l == nil {
 			f.helping = false
 			f.lockersMu.Unlock()
 			f.mu.Unlock()
 			return
 		}
-		l := f.lockers[0]
-		f.lockers = slices.Delete(f.lockers, 0, 1)
+		f.dequeue(l)
 		f.lockersMu.Unlock()
 
 		select {
@@ -399,9 +440,16 @@ func (f *flight[K, T]) initial(s *Subscription[T], policy Overflow) bool {
 
 func (f *flight[K, T]) leave(s *Subscription[T]) error {
 	f.mu.Lock()
-	if i := slices.Index(f.subs, s); i >= 0 {
-		f.subs = slices.Delete(f.subs, i, i+1)
-		s.end(ErrClosed)
+	select {
+	case <-s.done:
+		// Ended already, which takes a subscriber out of f.subs or never puts
+		// it in: evicted, or ended with its key. No need to look for it, which
+		// after a mass eviction would make closing them all quadratic.
+	default:
+		if i := slices.Index(f.subs, s); i >= 0 {
+			f.subs = slices.Delete(f.subs, i, i+1)
+			s.end(ErrClosed)
+		}
 	}
 	f.mu.Unlock()
 

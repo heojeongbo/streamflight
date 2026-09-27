@@ -459,15 +459,23 @@ func (g *Group[K, T]) subscribe(ctx context.Context, key K, s *Subscription[T]) 
 // unless done is closed first. sampler says whether the caller samples rather
 // than being delivered to.
 func (g *Group[K, T]) acquire(ctx context.Context, done <-chan struct{}, key K, sampler bool) (*flight[K, T], error) {
+	var waited *flight[K, T] // an open this caller waited on, counted as pending
 	for {
 		if done != nil {
 			select {
 			case <-done:
+				g.giveUpWaiting(waited)
 				return nil, ctx.Err()
 			default:
 			}
 		}
 		g.mu.Lock()
+		if waited != nil {
+			// No longer pending on it: whatever happens next, joining it
+			// included, happens in this critical section.
+			waited.pending--
+			waited = nil
+		}
 		// Re-checked every time round, so a waiter woken by Close never parks
 		// again.
 		if g.closeDone != nil {
@@ -504,10 +512,15 @@ func (g *Group[K, T]) acquire(ctx context.Context, done <-chan struct{}, key K, 
 			// Another goroutine owns it. Wait for it to finish, then look
 			// again: the key may be free, or held by a fresh upstream.
 			w := f.waitLocked()
+			if f.st == opening {
+				f.pending++
+				waited = f
+			}
 			g.mu.Unlock()
 			select {
 			case <-w:
 			case <-done:
+				g.giveUpWaiting(waited)
 				return nil, ctx.Err() // nothing taken yet
 			}
 			if err := f.openErr; err != nil {
@@ -651,32 +664,55 @@ func (g *Group[K, T]) beginStop(f *flight[K, T]) bool {
 	return true
 }
 
-// release drops one reference to f and, if it was the last, stops f now or
+// release drops one reference to f and, if nobody is left, stops f now or
 // once it has lingered.
 func (g *Group[K, T]) release(f *flight[K, T]) error {
 	g.mu.Lock()
 	f.refs--
 	g.reportLocked(g.Hooks.Left, f.key, f.refs)
-	if f.refs > 0 {
-		g.mu.Unlock()
+	claimed := g.idleLocked(f)
+	g.mu.Unlock()
+
+	if !claimed {
 		return nil
 	}
+	// On this goroutine, so Close reports the stop error to its caller.
+	return g.doStop(f, nil)
+}
 
+// giveUpWaiting takes back the pending join of a caller that waited for f to
+// open and gave up, if f is not nil. If that was all that kept f from having
+// nobody, f is left as its last subscriber leaving would leave it.
+func (g *Group[K, T]) giveUpWaiting(f *flight[K, T]) {
+	if f == nil {
+		return
+	}
+	g.mu.Lock()
+	f.pending--
+	claimed := g.idleLocked(f)
+	g.mu.Unlock()
+
+	if claimed {
+		_ = g.doStop(f, nil)
+	}
+}
+
+// idleLocked deals with f once it may have nobody left: if nobody is
+// subscribed and nobody is waiting to join, it arms the linger timer, or
+// claims f and reports that the caller must stop it. It reports false when
+// f is still wanted or is already being stopped, by a Close, a takeover or
+// the timer. g.mu must be held.
+func (g *Group[K, T]) idleLocked(f *flight[K, T]) bool {
+	if f.refs > 0 || f.pending > 0 {
+		return false
+	}
 	if g.Linger > 0 && f.st == live && !f.ended.Load() {
 		f.gen++
 		gen := f.gen
 		f.timer = time.AfterFunc(g.Linger, func() { g.expire(f, gen) })
-		g.mu.Unlock()
-		return nil
+		return false
 	}
-	claimed := g.beginStop(f)
-	g.mu.Unlock()
-
-	if !claimed {
-		return nil // already being stopped, by a Close, a takeover or the timer
-	}
-	// On this goroutine, so Close reports the stop error to its caller.
-	return g.doStop(f, nil)
+	return g.beginStop(f)
 }
 
 // expire stops f once it has lingered, unless a subscriber came back since.
