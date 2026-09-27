@@ -55,7 +55,13 @@ type Emitter[T any] interface {
 // error from that Source fails Subscribe, while an error from run never does.
 // It ends the upstream, and the subscription Subscribe returned ends with it.
 // The same goes for [Poll], whose interval can come from the key this way.
+// Run panics on a nil run, rather than on the goroutine it would start it on.
 func Run[K comparable, T any](run func(ctx context.Context, key K, e Emitter[T]) error) Source[K, T] {
+	if run == nil {
+		// Here rather than on the goroutine run is started on, where the
+		// panic would come after a successful Subscribe and crash the program.
+		panic("streamflight: Run with a nil function")
+	}
 	return func(key K, e Emitter[T]) (func() error, error) {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
@@ -101,11 +107,14 @@ func Run[K comparable, T any](run func(ctx context.Context, key K, e Emitter[T])
 // closes over them, since a Source runs once per upstream and Poll returns one.
 //
 // Opening a key whose interval is not positive fails with [ErrPollInterval]
-// rather than spinning.
+// rather than spinning. Poll panics on a nil tick.
 func Poll[K comparable, T any](
 	interval time.Duration,
 	tick func(ctx context.Context, key K, e Emitter[T]) error,
 ) Source[K, T] {
+	if tick == nil {
+		panic("streamflight: Poll with a nil function")
+	}
 	run := Run(func(ctx context.Context, key K, e Emitter[T]) error {
 		// Zero, so the first tick is on open; reset after the work, so the
 		// interval is quiet time rather than a deadline the work can miss.

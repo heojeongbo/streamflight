@@ -1334,11 +1334,72 @@ func TestMisuse(t *testing.T) {
 	})
 	t.Run("an unknown Overflow panics rather than drop some other way", func(t *testing.T) {
 		x := require.New(t)
-		x.PanicsWithValue("streamflight: WithOverflow with an unknown Overflow 4", func() {
+		const want = "; want DropOldest, DropNewest, Block or Evict"
+		x.PanicsWithValue("streamflight: WithOverflow with an unknown Overflow 4"+want, func() {
 			streamflight.WithOverflow(streamflight.Evict + 1)
 		})
-		x.PanicsWithValue("streamflight: WithOverflow with an unknown Overflow -1", func() {
+		x.PanicsWithValue("streamflight: WithOverflow with an unknown Overflow -1"+want, func() {
 			streamflight.WithOverflow(-1)
+		})
+	})
+	t.Run("a nil function panics under every name, before anything is opened", func(t *testing.T) {
+		x := require.New(t)
+		var opened atomic.Int64
+		g := &streamflight.Group[string, int]{
+			Source: func(string, streamflight.Emitter[int]) (func() error, error) {
+				opened.Add(1)
+				return nil, nil
+			},
+		}
+		x.PanicsWithValue("streamflight: SubscribeFuncContext with a nil function", func() {
+			g.SubscribeFuncContext(context.Background(), "k", nil)
+		})
+		x.PanicsWithValue("streamflight: Run with a nil function", func() {
+			streamflight.Run[string, int](nil)
+		})
+		x.PanicsWithValue("streamflight: Poll with a nil function", func() {
+			streamflight.Poll[string, int](time.Second, nil)
+		})
+		x.PanicsWithValue("streamflight: nil SubscribeOption", func() {
+			var opt streamflight.SubscribeOption // left unset on some branch
+			g.Subscribe("k", opt)
+		})
+		x.Zero(opened.Load())
+	})
+	t.Run("Drain and Wait refuse a nil context or send, and lose nothing doing it", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+		var nilCtx context.Context
+
+		s, err := g.Subscribe("k", streamflight.WithBuffer(4))
+		x.NoError(err)
+		defer s.Close()
+		r.emit("k", 1)
+		x.PanicsWithValue("streamflight: Drain with a nil send", func() {
+			s.Drain(context.Background(), nil)
+		})
+		x.PanicsWithValue("streamflight: nil Context", func() {
+			s.Drain(nilCtx, func(int) error { return nil })
+		})
+		x.Equal([]int{1}, drain(s.C), "the value is still there")
+
+		l, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		defer l.Close()
+		r.emit("k", 2)
+		x.PanicsWithValue("streamflight: nil Context", func() {
+			l.Wait(nilCtx, time.Time{}) // even with a value there to return
+		})
+	})
+	t.Run("a Subscription no Group made is refused", func(t *testing.T) {
+		x := require.New(t)
+		var zero streamflight.Subscription[int]
+		x.PanicsWithValue("streamflight: Drain on a subscription with no channel", func() {
+			zero.Drain(context.Background(), func(int) error { return nil })
+		}, "rather than wait for a value that cannot come")
+		x.PanicsWithValue("streamflight: Latest on a subscription that is delivered to", func() {
+			zero.Latest()
 		})
 	})
 	t.Run("retaining the send of Initial panics", func(t *testing.T) {
@@ -2508,6 +2569,33 @@ func TestSubscribeContext(t *testing.T) {
 			close(gate)
 			x.ErrorIs(<-res, boom, "as Subscribe would")
 		})
+	})
+	t.Run("each Context variant makes the kind of subscription its name says", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+		ctx := t.Context()
+
+		ch, err := g.SubscribeContext(ctx, "k", streamflight.WithBuffer(4))
+		x.NoError(err)
+		var got collector
+		fn, err := g.SubscribeFuncContext(ctx, "k", got.Add)
+		x.NoError(err)
+		l, err := g.SubscribeLatestContext(ctx, "k")
+		x.NoError(err)
+
+		r.emit("k", 5)
+		x.Equal([]int{5}, drain(ch.C))
+		x.Equal([]int{5}, got.Values())
+		x.Nil(fn.C)
+		x.Nil(l.C)
+		v, _, ok := l.Latest()
+		x.True(ok)
+		x.Equal(5, v)
+		x.Panics(func() { fn.Latest() }, "a function subscriber, not a sampler")
+		for _, s := range []*streamflight.Subscription[int]{ch, fn, l} {
+			x.NoError(s.Close())
+		}
 	})
 	t.Run("once it has returned, the context has no effect", func(t *testing.T) {
 		x := require.New(t)

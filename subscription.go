@@ -65,7 +65,8 @@ func WithBuffer(n int) SubscribeOption {
 // let a mistyped policy lose values some other way than the one asked for.
 func WithOverflow(o Overflow) SubscribeOption {
 	if o < DropOldest || o > Evict {
-		panic(fmt.Sprintf("streamflight: WithOverflow with an unknown Overflow %d", int(o)))
+		panic(fmt.Sprintf("streamflight: WithOverflow with an unknown Overflow %d;"+
+			" want DropOldest, DropNewest, Block or Evict", int(o)))
 	}
 	return func(c subscribeConfig) subscribeConfig { c.overflow = o; return c }
 }
@@ -102,10 +103,12 @@ type Subscription[T any] struct {
 // and ch happen to be nil.
 type kind uint8
 
+// The zero kind is none of them, so that a Subscription no Group made is
+// refused by every method that needs to know.
 const (
-	queued  kind = iota // Subscribe: values queue on ch
-	called              // SubscribeFunc: fn is called with each value
-	sampled             // SubscribeLatest: the key keeps its newest value
+	queued  kind = iota + 1 // Subscribe: values queue on ch
+	called                  // SubscribeFunc: fn is called with each value
+	sampled                 // SubscribeLatest: the key keeps its newest value
 )
 
 type owner[T any] interface {
@@ -206,8 +209,10 @@ func (s *Subscription[T]) Latest() (v T, at time.Time, ok bool) {
 // already replaced.
 //
 // Like [Subscription.Latest] it is valid only on a subscription from
-// [Group.SubscribeLatest], and waits on nothing a delivery can hold.
+// [Group.SubscribeLatest], and waits on nothing a delivery can hold. It
+// panics on a nil ctx.
 func (s *Subscription[T]) Wait(ctx context.Context, after time.Time) (v T, at time.Time, ok bool) {
+	mustContext(ctx)
 	if s.kind != sampled {
 		panic("streamflight: Wait on a subscription that is delivered to")
 	}
@@ -247,8 +252,13 @@ func (s *Subscription[T]) Wait(ctx context.Context, after time.Time) (v T, at ti
 //
 // Drain does not close the subscription. The caller still owns it, and may
 // Drain it again. It panics on a subscription that has no channel to drain,
-// which is any made by [Group.SubscribeFunc] or [Group.SubscribeLatest].
+// which is any made by [Group.SubscribeFunc] or [Group.SubscribeLatest], and
+// on a nil ctx or send, before it takes a value.
 func (s *Subscription[T]) Drain(ctx context.Context, send func(T) error) error {
+	mustContext(ctx)
+	if send == nil {
+		panic("streamflight: Drain with a nil send") // before taking a value to lose
+	}
 	if s.kind != queued {
 		panic("streamflight: Drain on a subscription with no channel")
 	}

@@ -56,8 +56,9 @@ type Group[K comparable, T any] struct {
 	Source Source[K, T]
 
 	// Replay is how many of the latest values a key remembers and delivers to
-	// each subscriber that joins it, oldest first, before any live value.
-	// Values emitted while the key lingers with no subscriber count too.
+	// each subscriber that joins it, oldest first, before any live value;
+	// zero or less remembers none. Values emitted while the key lingers with
+	// no subscriber count too.
 	//
 	// Use it for state that is published only on change, where a late
 	// subscriber would otherwise see nothing until the next change. Do not use
@@ -74,7 +75,8 @@ type Group[K comparable, T any] struct {
 	// ReplayFor, if set, is Replay for one key, and replaces it. Use it when
 	// only some keys are state a late subscriber has to be caught up on: a
 	// topic published on change wants 1, a stream of events on the same Group
-	// wants 0, and neither needs a Group of its own.
+	// wants 0, and neither needs a Group of its own. As for Replay, zero or
+	// less remembers none.
 	//
 	// It is called once per upstream, as the key is opened, with no Group lock
 	// held and possibly at the same time as another key's. What it returns is
@@ -100,7 +102,7 @@ type Group[K comparable, T any] struct {
 
 	// Linger keeps an upstream running this long after its last subscriber
 	// leaves, so a subscriber that comes back in time, such as a reloaded page,
-	// reuses it instead of opening it again. Zero stops it immediately.
+	// reuses it instead of opening it again. Zero or less stops it at once.
 	Linger time.Duration
 
 	// Hooks observe the Group, for logging and metrics.
@@ -224,6 +226,9 @@ func (g *Group[K, T]) SubscribeContext(ctx context.Context, key K, opts ...Subsc
 func (g *Group[K, T]) subscribeQueued(ctx context.Context, key K, opts []SubscribeOption) (*Subscription[T], error) {
 	c := subscribeConfig{buffer: 1}
 	for _, opt := range opts {
+		if opt == nil {
+			panic("streamflight: nil SubscribeOption")
+		}
 		c = opt(c)
 	}
 
@@ -241,20 +246,24 @@ func (g *Group[K, T]) subscribeQueued(ctx context.Context, key K, opts []Subscri
 // finds it nil for those. fn must not block; see the package documentation.
 // A nil fn panics.
 func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error) {
+	if fn == nil {
+		panic("streamflight: SubscribeFunc with a nil function")
+	}
 	return g.subscribeCalled(nil, key, fn)
 }
 
 // SubscribeFuncContext is SubscribeFunc, giving up as [Group.SubscribeContext]
-// does if ctx is done while it waits to join the key.
+// does if ctx is done while it waits to join the key. It panics on a nil ctx
+// or a nil fn.
 func (g *Group[K, T]) SubscribeFuncContext(ctx context.Context, key K, fn func(T)) (*Subscription[T], error) {
 	mustContext(ctx)
+	if fn == nil {
+		panic("streamflight: SubscribeFuncContext with a nil function")
+	}
 	return g.subscribeCalled(ctx, key, fn)
 }
 
 func (g *Group[K, T]) subscribeCalled(ctx context.Context, key K, fn func(T)) (*Subscription[T], error) {
-	if fn == nil {
-		panic("streamflight: SubscribeFunc with a nil function")
-	}
 	s := newSubscription[T](called, fn, nil, 0)
 	if err := g.subscribe(ctx, key, s); err != nil {
 		return nil, err
@@ -287,6 +296,7 @@ func (g *Group[K, T]) SubscribeLatest(key K) (*Subscription[T], error) {
 
 // SubscribeLatestContext is SubscribeLatest, giving up as
 // [Group.SubscribeContext] does if ctx is done while it waits to join the key.
+// It panics on a nil ctx.
 func (g *Group[K, T]) SubscribeLatestContext(ctx context.Context, key K) (*Subscription[T], error) {
 	mustContext(ctx)
 	return g.subscribeSampled(ctx, key)
