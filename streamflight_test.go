@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"runtime"
 	"slices"
 	"strings"
@@ -1770,6 +1771,71 @@ func TestGroupClose(t *testing.T) {
 			x.NoError(other.Close())
 		}
 	})
+	t.Run("no shape of derived keys hangs Close on a stalled Block subscriber", func(t *testing.T) {
+		// Each key but raw feeds on the key named, and its stop closes that
+		// subscription. The stalled Block subscriber is on the key named last.
+		shapes := []struct {
+			name  string
+			feeds map[string]string
+			stall string
+		}{
+			{"two derived keys", map[string]string{"d1": "raw", "d2": "raw"}, "raw"},
+			{"a chain, stalled at its root", map[string]string{"mid": "raw", "top": "mid"}, "raw"},
+			{"a chain, stalled in its middle", map[string]string{"mid": "raw", "top": "mid"}, "mid"},
+		}
+		for _, shape := range shapes {
+			t.Run(shape.name, func(t *testing.T) {
+				for range 10 { // keys come up in any order
+					x := require.New(t)
+					var mu sync.Mutex
+					emitters := map[string]streamflight.Emitter[int]{}
+					g := &streamflight.Group[string, int]{}
+					g.Source = func(key string, e streamflight.Emitter[int]) (func() error, error) {
+						mu.Lock()
+						emitters[key] = e
+						mu.Unlock()
+						from, ok := shape.feeds[key]
+						if !ok {
+							return nil, nil
+						}
+						sub, err := g.SubscribeFunc(from, func(v int) { e.Emit(v) })
+						if err != nil {
+							return nil, err
+						}
+						return sub.Close, nil
+					}
+
+					var subs []*streamflight.Subscription[int]
+					for key := range shape.feeds {
+						s, err := g.SubscribeFunc(key, func(int) {})
+						x.NoError(err)
+						subs = append(subs, s)
+					}
+					reached := make(chan struct{})
+					signal, err := g.SubscribeFunc(shape.stall, func(v int) {
+						if v == 2 {
+							close(reached)
+						}
+					})
+					x.NoError(err)
+					stalled, err := g.Subscribe(shape.stall, streamflight.WithOverflow(streamflight.Block))
+					x.NoError(err)
+					mu.Lock()
+					e := emitters[shape.stall]
+					mu.Unlock()
+					e.Emit(1) // stalled is full
+					go e.Emit(2)
+					<-reached // and this delivery waits on it
+
+					returns(t, func() { err = g.Close() })
+					x.NoError(err)
+					for _, s := range append(subs, signal, stalled) {
+						x.NoError(s.Close())
+					}
+				}
+			})
+		}
+	})
 	t.Run("a stop that closes a subscription to a key with a stalled Block subscriber does not hang", func(t *testing.T) {
 		// derived is fed by a subscription to raw, which its stop closes. raw
 		// has a Block subscriber that stopped reading, so raw's delivery holds
@@ -2597,6 +2663,97 @@ func TestSubscribeContext(t *testing.T) {
 			x.NoError(s.Close())
 		}
 	})
+	t.Run("under churn, every reference is given back and every open stopped", func(t *testing.T) {
+		x := require.New(t)
+		var mu sync.Mutex
+		opens, stops, joins, leaves := 0, 0, 0, 0
+		g := &streamflight.Group[string, int]{
+			Source: func(string, streamflight.Emitter[int]) (func() error, error) {
+				mu.Lock()
+				opens++
+				mu.Unlock()
+				time.Sleep(time.Duration(rand.IntN(200)) * time.Microsecond)
+				return func() error {
+					mu.Lock()
+					stops++
+					mu.Unlock()
+					return nil
+				}, nil
+			},
+			Hooks: streamflight.Hooks[string, int]{
+				Joined: func(string, int) { joins++ }, // under the Group's lock
+				Left:   func(string, int) { leaves++ },
+			},
+		}
+
+		before := runtime.NumGoroutine()
+		var wg sync.WaitGroup
+		for i := range 16 {
+			wg.Go(func() {
+				for j := range 200 {
+					key := fmt.Sprint("k", (i+j)%3)
+					ctx, cancel := context.WithTimeout(context.Background(), time.Duration(rand.IntN(300))*time.Microsecond)
+					var s *streamflight.Subscription[int]
+					var err error
+					switch j % 3 {
+					case 0:
+						s, err = g.SubscribeContext(ctx, key, streamflight.WithOverflow(streamflight.Block))
+					case 1:
+						s, err = g.SubscribeFuncContext(ctx, key, func(int) {})
+					default:
+						s, err = g.Subscribe(key)
+					}
+					cancel()
+					if err == nil {
+						s.Close()
+					} else if !errors.Is(err, context.DeadlineExceeded) {
+						t.Error(err)
+					}
+				}
+			})
+		}
+		wg.Wait()
+		x.NoError(g.Close())
+		x.Equal(opens, stops, "every upstream opened was stopped")
+		x.Equal(joins, leaves, "every Joined was followed by a Left")
+		eventually(t, func() bool { return runtime.NumGoroutine() <= before }, "no goroutine is left behind")
+	})
+	t.Run("Close with Context callers queued for a held key", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		reached := make(chan struct{})
+		first, err := g.SubscribeFunc("k", func(v int) {
+			if v == 2 {
+				close(reached)
+			}
+		})
+		x.NoError(err)
+		stalled, err := g.Subscribe("k", streamflight.WithOverflow(streamflight.Block))
+		x.NoError(err)
+		r.emit("k", 1)
+		go r.emit("k", 2)
+		<-reached
+
+		joined := make(chan *streamflight.Subscription[int], 3)
+		for range 3 {
+			go func() { joined <- must(g.SubscribeContext(t.Context(), "k")) }()
+		}
+		eventually(t, helping, "they queue for the lock")
+		returns(t, func() { err = g.Close() })
+		x.NoError(err)
+		for range 3 {
+			var s *streamflight.Subscription[int]
+			returns(t, func() { s = <-joined })
+			x.ErrorIs(s.Err(), streamflight.ErrGroupClosed, "handed the lock, then found the key ended")
+			x.NoError(s.Close())
+		}
+		eventually(t, func() bool { return !helping() }, "and the lock is let go")
+		x.NoError(first.Close())
+		x.NoError(stalled.Close())
+		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
 	t.Run("once it has returned, the context has no effect", func(t *testing.T) {
 		x := require.New(t)
 		r := newRecorder()
@@ -2773,6 +2930,97 @@ func TestEndedAndEvicted(t *testing.T) {
 		}
 		x.Zero(ended.Load())
 		x.Equal(int64(4), stopped.Load())
+	})
+	t.Run("an End racing Close ends every subscriber with one reason", func(t *testing.T) {
+		for range 200 {
+			x := require.New(t)
+			boom := errors.New("boom")
+			r := newRecorder()
+			var ended atomic.Int64
+			g := &streamflight.Group[string, int]{
+				Source: r.Source,
+				Hooks:  streamflight.Hooks[string, int]{Ended: func(string, error) { ended.Add(1) }},
+			}
+			var subs []*streamflight.Subscription[int]
+			for range 3 {
+				s, err := g.Subscribe("k")
+				x.NoError(err)
+				subs = append(subs, s)
+			}
+			var wg sync.WaitGroup
+			wg.Go(func() { r.emitter("k").End(boom) })
+			wg.Go(func() { g.Close() })
+			wg.Wait()
+
+			reason := subs[0].Err()
+			for _, s := range subs {
+				x.Equal(reason, s.Err(), "one reason for all")
+				x.NoError(s.Close())
+			}
+			x.True(errors.Is(reason, boom) || errors.Is(reason, streamflight.ErrGroupClosed), reason)
+			if ended.Load() > 0 {
+				// Reported only when the End came before Close began, and
+				// then with the reason its subscribers were given.
+				x.Equal(int64(1), ended.Load())
+				x.ErrorIs(reason, boom)
+			}
+		}
+	})
+	t.Run("Ended comes before Stopped on every way a key is stopped", func(t *testing.T) {
+		ways := map[string]func(g *streamflight.Group[string, int], s *streamflight.Subscription[int]){
+			"the last subscriber leaving": func(_ *streamflight.Group[string, int], s *streamflight.Subscription[int]) { s.Close() },
+			"the next subscriber taking over": func(g *streamflight.Group[string, int], _ *streamflight.Subscription[int]) {
+				must(g.Subscribe("k")).Close()
+			},
+			"Close": func(g *streamflight.Group[string, int], _ *streamflight.Subscription[int]) { g.Close() },
+		}
+		for name, stop := range ways {
+			t.Run(name, func(t *testing.T) {
+				x := require.New(t)
+				r := newRecorder()
+				var mu sync.Mutex
+				var log []string
+				report := func(what string) {
+					mu.Lock()
+					log = append(log, what)
+					mu.Unlock()
+				}
+				inEnded, release := make(chan struct{}), make(chan struct{})
+				g := &streamflight.Group[string, int]{
+					Source: r.Source,
+					Hooks: streamflight.Hooks[string, int]{
+						Ended: func(key string, _ error) {
+							if len(r.Log()) == 1 { // the first upstream only
+								close(inEnded)
+								<-release
+							}
+							report("ended")
+						},
+						Stopped: func(string, error) { report("stopped") },
+					},
+				}
+				s, err := g.Subscribe("k")
+				x.NoError(err)
+				go r.emitter("k").End(nil)
+				<-inEnded
+				stopped := make(chan struct{})
+				go func() {
+					stop(g, s)
+					close(stopped)
+				}()
+				time.Sleep(10 * time.Millisecond)
+				mu.Lock()
+				x.Empty(log, "the stop waits for Ended")
+				mu.Unlock()
+				close(release)
+				<-stopped
+				mu.Lock()
+				x.Equal([]string{"ended", "stopped"}, log[:2])
+				mu.Unlock()
+				s.Close()
+				g.Close()
+			})
+		}
 	})
 	t.Run("Ended comes before Stopped even when another goroutine stops it", func(t *testing.T) {
 		x := require.New(t)
@@ -3092,6 +3340,46 @@ func TestPanics(t *testing.T) {
 		x.Equal([]int{1, 3}, drain(keep.C), "2 never got past the panic")
 		x.NoError(a.Close())
 		x.NoError(keep.Close())
+	})
+	t.Run("an Evicted hook that panics on a later eviction of one pass leaves nobody ended in", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		var evictions atomic.Int64
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Hooks: streamflight.Hooks[string, int]{
+				Evicted: func(string) {
+					if evictions.Add(1) == 2 {
+						panic(boom)
+					}
+				},
+			},
+		}
+
+		evict := streamflight.WithOverflow(streamflight.Evict)
+		var cut []*streamflight.Subscription[int]
+		for range 3 {
+			s, err := g.Subscribe("k", evict)
+			x.NoError(err)
+			cut = append(cut, s)
+		}
+		keep, err := g.Subscribe("k", streamflight.WithBuffer(8))
+		x.NoError(err)
+		r.emit("k", 1)
+		x.PanicsWithValue(boom, func() { r.emit("k", 2) }, "the second eviction's hook")
+
+		x.ErrorIs(cut[0].Err(), streamflight.ErrEvicted)
+		x.ErrorIs(cut[1].Err(), streamflight.ErrEvicted)
+		x.NoError(cut[2].Err(), "not reached, so still subscribed")
+
+		var n int
+		returns(t, func() { n = r.emit("k", 3) })
+		x.Equal(1, n, "keep takes it, with nothing sent to a closed queue")
+		x.ErrorIs(cut[2].Err(), streamflight.ErrEvicted, "the one not reached is evicted now")
+		x.Equal([]int{1, 3}, drain(keep.C), "2 never got past the panic")
+		for _, s := range append(cut, keep) {
+			x.NoError(s.Close())
+		}
 	})
 	t.Run("an Evicted hook that panics as a catch-up is cut gives the reference back", func(t *testing.T) {
 		x := require.New(t)

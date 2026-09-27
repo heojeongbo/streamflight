@@ -154,8 +154,9 @@ type Hooks[K comparable, T any] struct {
 	// It is called before the subscriber is sent what Replay and Initial have
 	// for it, so it is not a sign that the subscriber can receive yet, nor
 	// that it will be subscribed at all: one whose Context subscribe gives up
-	// waiting for the key's lock, or whose catch-up panics, is reported by
-	// Left next, with no subscription to close.
+	// after Joined reported it, as the one that opened the key can once its
+	// Source returns, or whose catch-up panics, is reported by Left next,
+	// with no subscription to close.
 	Joined func(key K, n int)
 
 	// Left is called when a subscriber of key closes, or leaves again without
@@ -178,7 +179,10 @@ type Hooks[K comparable, T any] struct {
 	// Ended is called when the upstream of key ends by itself, through
 	// [Emitter.End], with the error its subscribers are closed with: io.EOF
 	// for End(nil). It is called before Stopped reports the same upstream, and
-	// not at all for one the Group stops.
+	// not at all for one the Group had begun to stop, even if an End that came
+	// after is what closed its subscribers. A Source that calls End while it is
+	// opening and then fails the open is reported as Ended and never Stopped:
+	// there was nothing to stop, and nobody subscribed to close.
 	Ended func(key K, err error)
 }
 
@@ -200,7 +204,8 @@ func (g *Group[K, T]) Subscribe(key K, opts ...SubscribeOption) (*Subscription[T
 // or stopping the key, or for a delivery in progress, such as one a Block
 // subscriber holds up, to let it take the key's lock. Callers waiting for that
 // lock queue for it, and one goroutine per key waits for it on their behalf
-// until it is free and nobody is queued.
+// until it is free and nobody is queued. It does not give up while a Joined or
+// Left hook, of any key, holds the lock the whole Group shares.
 //
 // It cannot give up while it runs code that takes no context, or waits for code
 // that does not: the Source, ReplayFor and the Opened hook when it is the one
@@ -323,6 +328,12 @@ func mustContext(ctx context.Context) {
 // Close waits for an upstream another goroutine is opening or stopping, and a
 // second Close waits for the first: once any Close returns, every upstream of
 // the Group has been stopped.
+//
+// Groups that feed one another, where a Source of one subscribes to a key of
+// the other, must be closed together, each on its own goroutine. Closed one
+// after the other, either order can hang: the stop of the Group closed first
+// can wait on a delivery of the other that a stalled Block subscriber holds
+// up, which only closing the other releases.
 func (g *Group[K, T]) Close() error {
 	g.mu.Lock()
 	if g.closeDone != nil {

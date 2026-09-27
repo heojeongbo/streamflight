@@ -128,3 +128,31 @@ func TestLockQueue(t *testing.T) {
 	f.enqueue(b)
 	x.Equal([]*locker{b}, order(), "and the queue works again")
 }
+
+// An Emit that evicts leaves no reference to those it evicted in the spare
+// capacity of the key's list, where they would outlive their Close.
+func TestEvictionClearsWhatItMovesPast(t *testing.T) {
+	x := require.New(t)
+	g := &Group[string, int]{
+		Source: func(string, Emitter[int]) (func() error, error) { return nil, nil },
+	}
+	var subs []*Subscription[int]
+	for range 4 {
+		s, err := g.Subscribe("k", WithOverflow(Evict))
+		x.NoError(err)
+		subs = append(subs, s)
+	}
+	keep, err := g.SubscribeFunc("k", func(int) {})
+	x.NoError(err)
+	f := g.flights["k"]
+
+	f.Emit(1)
+	f.Emit(2) // evicts all four channel subscribers
+	x.Len(f.subs, 1)
+	for _, s := range f.subs[1:cap(f.subs)] {
+		x.Nil(s, "nothing left behind in the backing array")
+	}
+	for _, s := range append(subs, keep) {
+		x.NoError(s.Close())
+	}
+}

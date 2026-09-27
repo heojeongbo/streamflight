@@ -90,7 +90,9 @@
 //   - Keys are independent: opening or stopping one key never waits for
 //     another, and neither does a subscriber that has fallen behind, except
 //     inside [Group.Close], which stops keys one at a time, and while a Joined
-//     or Left hook runs under the lock the whole Group shares.
+//     or Left hook runs under the lock the whole Group shares. A key derived
+//     from another depends on it through its own Source and stop func, which
+//     wait on that key as any subscriber of it does.
 //
 // # Rules
 //

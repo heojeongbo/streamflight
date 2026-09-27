@@ -335,35 +335,51 @@ func BenchmarkSharedVsDedicated(b *testing.B) {
 }
 
 // BenchmarkEvictAll is one Emit that evicts every subscriber of a key at once,
-// the worst case for taking them out of the key's list.
+// the worst case for taking them out of the key's list, and one that evicts
+// every other one, which also moves each that stays.
 func BenchmarkEvictAll(b *testing.B) {
-	for _, n := range []int{100, 1000, 10000} {
-		b.Run(fmt.Sprintf("subscribers=%d", n), func(b *testing.B) {
-			b.ReportAllocs()
-			for range b.N {
-				b.StopTimer()
-				var e streamflight.Emitter[int]
-				var subs []*streamflight.Subscription[int]
-				g := &streamflight.Group[string, int]{
-					Source: func(_ string, e_ streamflight.Emitter[int]) (func() error, error) {
-						e = e_
-						return nil, nil
-					},
-				}
-				for range n {
-					subs = append(subs, must(g.Subscribe("k", streamflight.WithOverflow(streamflight.Evict))))
-				}
-				e.Emit(0) // every queue is full
-				b.StartTimer()
+	for _, bench := range []struct {
+		name  string
+		every int // every how many subscribers one stays
+	}{{"all", 0}, {"half", 2}} {
+		for _, n := range []int{100, 1000, 10000} {
+			b.Run(fmt.Sprintf("%s/subscribers=%d", bench.name, n), func(b *testing.B) {
+				evictN(b, n, bench.every)
+			})
+		}
+	}
+}
 
-				e.Emit(1) // and every subscriber is evicted
-
-				b.StopTimer()
-				for _, s := range subs {
-					s.Close()
-				}
-				b.StartTimer()
+// evictN times one Emit that evicts n subscribers of a key, but for every
+// every-th one, which stays; every of zero evicts them all.
+func evictN(b *testing.B, n, every int) {
+	b.ReportAllocs()
+	for range b.N {
+		b.StopTimer()
+		var e streamflight.Emitter[int]
+		var subs []*streamflight.Subscription[int]
+		g := &streamflight.Group[string, int]{
+			Source: func(_ string, e_ streamflight.Emitter[int]) (func() error, error) {
+				e = e_
+				return nil, nil
+			},
+		}
+		for i := range n {
+			o := streamflight.Evict
+			if every > 0 && i%every == 0 {
+				o = streamflight.DropOldest // stays
 			}
-		})
+			subs = append(subs, must(g.Subscribe("k", streamflight.WithOverflow(o))))
+		}
+		e.Emit(0) // every queue is full
+		b.StartTimer()
+
+		e.Emit(1) // and every subscriber but those that stay is evicted
+
+		b.StopTimer()
+		for _, s := range subs {
+			s.Close()
+		}
+		b.StartTimer()
 	}
 }

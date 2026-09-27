@@ -260,7 +260,9 @@ refused value.
 - **Keys are independent.** Opening or stopping one key never waits for
   another, and neither does a subscriber that has fallen behind, except inside
   `Group.Close`, which stops keys one at a time, and while a `Joined` or `Left`
-  hook runs under the lock the whole Group shares.
+  hook runs under the lock the whole Group shares. A key derived from another
+  depends on it through its own `Source` and `stop`, which wait on that key as
+  any subscriber of it does.
 
 ## Rules
 
@@ -278,6 +280,12 @@ refused value.
   is what a stream derived from another one needs. They must not subscribe to
   their own key or close the Group — a key is held from the moment it starts
   opening until its `stop` has returned, so either call would wait for itself.
+- A `stop` must return: its key is unavailable until it does, and `Close`
+  waits for it. `Close` ends every key before running any of their stops, and
+  so waits first for each key's delivery in progress: a delivery must not wait
+  on anything that only a stop in the same Group would release.
+- Groups that feed one another must be closed together, each `Close` on its
+  own goroutine. Closed one after the other, either order can hang.
 - Hooks must not call back into the Group. `Joined` and `Left` run under a lock
   shared by the whole Group, so keep them short.
 - A panic in your code fails the call it ran in. The Group is not left locked
