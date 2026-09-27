@@ -107,11 +107,11 @@ func Run[K comparable, T any](run func(ctx context.Context, key K, e Emitter[T])
 //
 // A tick that returns an error ends the upstream with it, closing every
 // subscriber; the next subscriber opens a fresh one, as [Emitter.End] says. As
-// for [Run], an error returned once the Group is stopping the key is
-// discarded. To make a failure a value
-// instead, which is usually right for a backend expected to come back, emit it
-// and return nil: ending the stream would turn one outage into a reconnect
-// loop. A tick with nothing to report simply does not emit.
+// for [Run], an error returned once the Group is stopping the key is discarded.
+// To make a failure a value instead, which is usually right for a backend
+// expected to come back, emit it and return nil: ending the stream would turn
+// one outage into a reconnect loop. A tick with nothing to report simply does
+// not emit.
 //
 // The interval belongs to the upstream, as does anything a tick remembers
 // between calls, such as the last value it sent. Both live in a Source that

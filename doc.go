@@ -16,8 +16,9 @@
 //
 // An upstream can also end by itself through [Emitter.End]. Every subscriber is
 // then closed with the error it ended with, and the next subscriber opens a
-// fresh upstream, unless the upstream ended as it opened: those waiting on the
-// open, and any who arrive before they have joined it, share that end.
+// fresh upstream. Those waiting on an open that the upstream ended during, and
+// any who arrive before they have joined it, are not the next: they share that
+// end.
 //
 // A Group need not have many keys. One upstream shared by whoever wants it,
 // opened by the first and stopped after the last, is a Group[struct{}, T]
@@ -128,8 +129,9 @@
 //     also ends every key it finds running before it runs any of their stops,
 //     and so waits first for each of their deliveries in progress: a delivery
 //     must not wait on anything that only a stop in the same Group would
-//     release. A key another goroutine is opening or stopping as Close begins
-//     is ended and stopped once that is done, after those stops.
+//     release. A key another goroutine is opening as Close begins is ended
+//     and stopped once its open is done, after those stops; one another
+//     goroutine is stopping is left to that stop, which Close waits for.
 //   - Subscribe waits while another goroutine is opening or stopping the same
 //     key. It never waits for another key's Source or stop func.
 //     [Group.SubscribeContext] and its siblings stop waiting, on that and on

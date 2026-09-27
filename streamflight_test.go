@@ -1577,7 +1577,9 @@ func TestLinger(t *testing.T) {
 	t.Run("a timer that fires as the key is taken over does not stop it again", func(t *testing.T) {
 		x := require.New(t)
 		// With one P the timer reaches the lock only once the takeover is
-		// over, and its guard has nothing left to guard against.
+		// over, and its guard has nothing left to guard against. Even with two
+		// it seldom reaches it while the takeover is stopping the key, which
+		// TestTimerFiringAsTheKeyIsTakenOver pins by hand.
 		defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(max(2, runtime.GOMAXPROCS(0))))
 		for range 20 { // it reaches the lock as the takeover stops the key, or after
 			r := newRecorder()
@@ -1753,10 +1755,12 @@ func TestEnd(t *testing.T) {
 	t.Run("an upstream that ends while opening ends its first subscriber", func(t *testing.T) {
 		x := require.New(t)
 		boom := errors.New("boom")
-		stops := 0
+		opens, stops := 0, 0
 		g := &streamflight.Group[string, int]{
 			Source: func(key string, e streamflight.Emitter[int]) (func() error, error) {
-				e.End(boom)
+				if opens++; opens == 1 {
+					e.End(boom)
+				}
 				return func() error { stops++; return nil }, nil
 			},
 		}
@@ -1765,8 +1769,18 @@ func TestEnd(t *testing.T) {
 		x.NoError(err)
 		<-s.Done()
 		x.ErrorIs(s.Err(), boom)
+
+		// Nobody waited on that open, so the next subscriber, s still held,
+		// opens a fresh upstream rather than share the end.
+		next, err := g.Subscribe("k")
+		x.NoError(err)
+		x.NoError(next.Err())
+		x.Equal(2, opens)
+		x.Equal(1, stops, "the ended upstream was stopped before the reopen")
+
 		x.NoError(s.Close())
-		x.Equal(1, stops)
+		x.NoError(next.Close())
+		x.Equal(2, stops)
 	})
 	t.Run("an upstream that ends and then fails to open is not stopped", func(t *testing.T) {
 		x := require.New(t)
@@ -1822,13 +1836,16 @@ func TestGroupClose(t *testing.T) {
 	})
 	t.Run("closing waits for a stop already in progress", func(t *testing.T) {
 		x := require.New(t)
+		boom := errors.New("boom")
 		r := newRecorder()
+		r.stopErr = boom
 		src, entered, release := gatedStops(r.Source)
 		g := &streamflight.Group[string, int]{Source: src}
 
 		s, err := g.Subscribe("k")
 		x.NoError(err)
-		go s.Close()
+		left := make(chan error, 1)
+		go func() { left <- s.Close() }()
 		x.Equal("k", <-entered) // parked inside the stop func
 
 		closed := make(chan error, 1)
@@ -1841,7 +1858,8 @@ func TestGroupClose(t *testing.T) {
 		}
 
 		release()
-		x.NoError(<-closed)
+		x.NoError(<-closed, "the stop was not Close's to report")
+		x.ErrorIs(<-left, boom, "but the Subscription.Close's that ran it")
 		x.Equal([]string{"open k", "stop k"}, r.Log())
 	})
 	t.Run("a second close waits for the first, and returns what it does", func(t *testing.T) {
@@ -2286,10 +2304,11 @@ func TestConcurrentOpen(t *testing.T) {
 			opens, stops := 0, 0
 			g := &streamflight.Group[string, int]{
 				Source: func(_ string, e streamflight.Emitter[int]) (func() error, error) {
-					opens++
-					e.End(boom)
-					close(ended)
-					<-gate // the rest of a slow open
+					if opens++; opens == 1 {
+						e.End(boom)
+						close(ended)
+						<-gate // the rest of a slow open
+					}
 					return func() error { stops++; return nil }, nil
 				},
 			}
@@ -2579,8 +2598,9 @@ func TestSubscribeContext(t *testing.T) {
 			src, gate := gated(r)
 			// It gives it back as a last subscriber leaving would, but what it
 			// opened is not stopped while the subscriber waiting on the same
-			// open has yet to join it.
-			g := &streamflight.Group[string, int]{Source: src, Linger: time.Hour}
+			// open has yet to join it. Without Linger, so that nothing but that
+			// wait keeps it running.
+			g := &streamflight.Group[string, int]{Source: src}
 
 			ctx, cancel := context.WithCancel(t.Context())
 			gaveUp := make(chan error, 1)
@@ -2602,8 +2622,6 @@ func TestSubscribeContext(t *testing.T) {
 			s := <-waiter
 			x.Equal([]string{"open k"}, r.Log(), "the waiter keeps what was opened")
 			x.NoError(s.Close())
-			time.Sleep(time.Hour)
-			synctest.Wait()
 			x.Equal([]string{"open k", "stop k"}, r.Log(), "and nothing is left held")
 		})
 	})
@@ -3893,40 +3911,56 @@ func TestPanics(t *testing.T) {
 	})
 	t.Run("a stop that panics in Close leaves later Closes the errors of the rest", func(t *testing.T) {
 		x := require.New(t)
-		failed := errors.New("stop failed")
+		before, after := errors.New("before"), errors.New("after")
+		var stops atomic.Int64
 		g := &streamflight.Group[string, int]{
-			Source: func(key string, _ streamflight.Emitter[int]) (func() error, error) {
+			Source: func(string, streamflight.Emitter[int]) (func() error, error) {
 				return func() error {
-					if key == "p" {
+					switch stops.Add(1) { // in the order Close runs them
+					case 1:
+						return before
+					case 2:
 						panic(boom)
 					}
-					return failed
+					return after
 				}, nil
 			},
 		}
-		p, err := g.Subscribe("p")
-		x.NoError(err)
-		e, err := g.Subscribe("e")
-		x.NoError(err)
+		var subs []*streamflight.Subscription[int]
+		for _, key := range []string{"a", "b", "c"} {
+			s, err := g.Subscribe(key)
+			x.NoError(err)
+			subs = append(subs, s)
+		}
 
-		x.PanicsWithValue(boom, func() { g.Close() }) // whichever key it stops first
+		x.PanicsWithValue(boom, func() { g.Close() })
+		var err error
 		returns(t, func() { err = g.Close() })
-		x.ErrorIs(err, failed, "not nil because the first Close panicked")
+		x.ErrorIs(err, before, "stopped before the panic, and not lost to it")
+		x.ErrorIs(err, after, "stopped after it")
+		x.Equal(int64(3), stops.Load())
 		x.Equal(err, g.Close(), "the same error every time")
-		x.NoError(p.Close())
-		x.NoError(e.Close())
+		for _, s := range subs {
+			x.NoError(s.Close())
+		}
 	})
 	t.Run("a stop that panics in Close still stops a key that was opening", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			x := require.New(t)
 			r := newRecorder()
 			release := make(chan struct{})
+			failed := errors.New("b's stop failed")
 			g := &streamflight.Group[string, int]{
 				Source: func(key string, e streamflight.Emitter[int]) (func() error, error) {
-					if key == "b" {
-						<-release
+					if key != "b" {
+						return r.Source(key, e)
 					}
-					return r.Source(key, e)
+					<-release
+					stop, err := r.Source(key, e)
+					return func() error {
+						_ = stop()
+						return failed
+					}, err
 				},
 				Hooks: streamflight.Hooks[string, int]{
 					Stopped: func(key string, _ error) {
@@ -3961,7 +3995,7 @@ func TestPanics(t *testing.T) {
 
 			var err2 error
 			returns(t, func() { err2 = g.Close() })
-			x.NoError(err2)
+			x.ErrorIs(err2, failed, "b's stop, run once a's had panicked, still counts")
 			x.NoError(a.Close())
 		})
 	})

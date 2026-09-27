@@ -103,7 +103,8 @@ type Group[K comparable, T any] struct {
 
 	// Linger keeps an upstream running this long after its last subscriber
 	// leaves, so a subscriber that comes back in time, such as a reloaded page,
-	// reuses it instead of opening it again. Zero or less stops it at once.
+	// reuses it instead of opening it again. Zero or less stops it at once. An
+	// upstream that has ended by itself does not linger.
 	Linger time.Duration
 
 	// Hooks observe the Group, for logging and metrics.
@@ -233,7 +234,9 @@ func (g *Group[K, T]) Subscribe(key K, opts ...SubscribeOption) (*Subscription[T
 // leaving would: a place in the upstream it opened or queued to join, or in
 // the open it waited on. An upstream it leaves with nobody subscribed and
 // nobody waiting to join is stopped at once, which runs the stop func on this
-// goroutine before it returns, or after [Group.Linger].
+// goroutine before it returns, or after [Group.Linger] unless it has ended.
+// Once a Close has begun, an open it waited on is left for that Close to stop,
+// so that Close returns what the stop func does.
 //
 // ctx bounds joining and nothing else. Once SubscribeContext has returned a
 // subscription, ctx has no effect on it, and giving up never ends the upstream
@@ -340,13 +343,15 @@ func mustContext(ctx context.Context) {
 
 // Close stops every upstream, ends every subscription with ErrGroupClosed and
 // makes later Subscribe calls fail with it. It returns the errors of the stop
-// funcs, joined, but for one that panicked or whose Stopped hook did. Close is
-// idempotent and returns the same error every time, a panic in the first one
-// included.
+// funcs it runs, joined. Close is idempotent and returns the same error every
+// time. If a stop func or Stopped hook panics, that Close panics too, and every
+// later one returns the errors of the rest.
 //
 // Close waits for an upstream another goroutine is opening or stopping, and a
 // second Close waits for the first: once any Close returns, every upstream of
-// the Group has been stopped.
+// the Group has been stopped. The error of a stop func Close only waits for is
+// not Close's to return: the [Subscription.Close] that ran it returns it, and
+// the Stopped hook reports it wherever it ran.
 //
 // Groups that feed one another, where a Source of one subscribes to a key of
 // the other, must be closed together, each on its own goroutine. Closed one

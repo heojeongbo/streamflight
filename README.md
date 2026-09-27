@@ -52,8 +52,9 @@ Then subscribe. Which way depends on what is done with each value:
 A handler that relays one key to one client is `Subscribe` and `Drain`, here
 `SubscribeContext`, so that a client that goes away while another client is
 opening the key, or while a stalled delivery holds it, is not waited for. It
-still waits for code that takes no context: the `Source` of a key it opens, and
-the `stop` of one it leaves with nobody as it goes:
+still waits for code that takes no context: the `Source` of a key it opens,
+the `stop` of an upstream that ended by itself, which it runs before opening
+the key again, and the `stop` of one it leaves with nobody as it goes:
 
 ```go
 func (s *Server) Watch(req *Request, stream grpc.ServerStreamingServer[Status]) error {
@@ -227,9 +228,9 @@ subscriber leaves, so a reloaded page reuses it instead of opening it again.
 
 **Upstreams that end.** A Source calls `Emitter.End` when its upstream ends by
 itself. Every subscriber is closed with that error, and the next subscriber
-opens a fresh upstream. One that ended as it opened is the exception: those
-waiting on the open, and any who arrive before they have joined it, share that
-end rather than each opening it again.
+opens a fresh upstream. Those waiting on an open that the upstream ended
+during, and any who arrive before they have joined it, share that end rather
+than each opening it again.
 
 **One key.** A Group need not have many. One upstream shared by whoever wants
 it, such as a socket or a device, is a `Group[struct{}, T]` subscribed to with

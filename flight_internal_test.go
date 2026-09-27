@@ -245,6 +245,37 @@ func TestGivingUpOnceCloseHasBegun(t *testing.T) {
 	x.ErrorIs(errors.Join(errs...), failed)
 }
 
+// A Linger timer that has fired as a takeover claims the key waits for the
+// Group's lock, and must find the key claimed rather than stop it again: the
+// takeover stops it without the lock, and until it is done the key is still
+// the flight's. From outside the timer reaches the lock in that window only
+// now and then, so the takeover's claim is made by hand.
+func TestTimerFiringAsTheKeyIsTakenOver(t *testing.T) {
+	x := require.New(t)
+	stops := 0
+	g := &Group[string, int]{
+		Source: func(string, Emitter[int]) (func() error, error) {
+			return func() error { stops++; return nil }, nil
+		},
+		Linger: time.Hour, // armed, but fired by hand below
+	}
+	s, err := g.Subscribe("k")
+	x.NoError(err)
+	x.NoError(s.Close())
+	f := g.flights["k"]
+
+	g.mu.Lock()
+	gen := f.gen     // what the timer was armed with
+	g.claimLocked(f) // as a takeover does, the timer already past Stop
+	g.mu.Unlock()
+	g.expire(f, gen)
+	x.Zero(stops, "left to the takeover")
+	x.Equal(stopping, f.st)
+
+	x.NoError(g.doStop(f, nil)) // the takeover's stop
+	x.Equal(1, stops)
+}
+
 // arrivedWithTheEnd is a key on which a value arrives and the subscription
 // ends between Wait finding nothing new and Wait selecting, so that both are
 // ready to select by then.

@@ -301,9 +301,9 @@ func (s *Subscription[T]) Drain(ctx context.Context, send func(T) error) error {
 
 // Close ends the subscription and releases its hold on the upstream. A Close
 // that leaves the upstream with nobody subscribed and nobody waiting to join
-// it stops the upstream, unless the Group lingers, and returns the error of
-// stop when this Close is what stopped it. Close is idempotent and returns the
-// same error every time.
+// it stops the upstream (after [Group.Linger], unless it has ended), and
+// returns the error of stop when this Close is what stopped it. Close is
+// idempotent and returns the same error every time.
 //
 // It takes the key's lock, so it waits for a delivery in progress on the key,
 // which a [Block] subscriber that has stopped reading holds up until it reads
