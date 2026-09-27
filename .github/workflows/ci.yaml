@@ -8,6 +8,7 @@ on:
     paths: &paths
       - .github/workflows/ci.yaml
       - "**.go"
+      - .dockerignore
       - docker-bake.hcl
       - Dockerfile
       - go.mod

@@ -11,7 +11,7 @@ services:
 
     volumes:
       - command.history:/commandhistory
-      - go.cache.mod:/home/hypnos/go/pkg/mod
+      - go.cache.mod:/go/pkg/mod
       - go.cache.bin:/home/hypnos/.cache/go-build
 
       - ..:/workspace
