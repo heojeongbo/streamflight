@@ -156,13 +156,12 @@ type Hooks[K comparable, T any] struct {
 	Stopped func(key K, err error)
 
 	// Joined is called when a subscriber joins key, with how many subscribers
-	// the upstream it joins has now.
-	// It is called before the subscriber is sent what Replay and Initial have
-	// for it, so it is not a sign that the subscriber can receive yet, nor
-	// that it will be subscribed at all: one whose Context subscribe gives up
-	// after Joined reported it, as the one that opened the key can once its
-	// Source returns, or whose catch-up panics, is reported by Left next,
-	// with no subscription to close.
+	// the upstream it joins has now. It is called before the subscriber is sent
+	// what Replay and Initial have for it, so it is not a sign that the
+	// subscriber can receive yet, nor that it will be subscribed at all: one
+	// whose Context subscribe gives up after Joined reported it, as the one
+	// that opened the key can once its Source returns, or whose catch-up
+	// panics, is reported by Left next, with no subscription to close.
 	Joined func(key K, n int)
 
 	// Left is called when a subscriber of key closes, or leaves again without
@@ -224,15 +223,17 @@ func (g *Group[K, T]) Subscribe(key K, opts ...SubscribeOption) (*Subscription[T
 // It cannot give up while it runs code that takes no context, or waits for code
 // that does not: the Source, ReplayFor and the Opened hook when it is the one
 // opening the key, and the stop of an upstream that ended by itself, which it
-// runs, waiting first for the key's lock, held while the Ended hook runs. Once
-// those return, it gives back what it took, the way a last subscriber leaving
-// would: stopped at once, which runs the stop func there and then, or after
-// [Group.Linger], but not while others that waited on the same open have yet
-// to join it. If the open it ran fails,
-// or a Close began while it ran, it returns that error instead, as Subscribe
-// would. Nor does it give up once it has the key's lock: from there it sends
-// what Replay and Initial have for it and joins, returning the subscription
-// even if ctx is done by then.
+// runs, waiting first for the key's lock, held while the Ended hook runs. If
+// the open it ran fails, or a Close began while it ran, it returns that error
+// instead, as Subscribe would. Nor does it give up once it has the key's lock:
+// from there it sends what Replay and Initial have for it and joins, returning
+// the subscription even if ctx is done by then.
+//
+// What it has taken when it gives up, it gives back the way a last subscriber
+// leaving would: a place in the upstream it opened or queued to join, or in
+// the open it waited on. An upstream it leaves with nobody subscribed and
+// nobody waiting to join is stopped at once, which runs the stop func on this
+// goroutine before it returns, or after [Group.Linger].
 //
 // ctx bounds joining and nothing else. Once SubscribeContext has returned a
 // subscription, ctx has no effect on it, and giving up never ends the upstream
@@ -339,7 +340,9 @@ func mustContext(ctx context.Context) {
 
 // Close stops every upstream, ends every subscription with ErrGroupClosed and
 // makes later Subscribe calls fail with it. It returns the errors of the stop
-// funcs, joined. Close is idempotent and returns the same error every time.
+// funcs, joined, but for one that panicked or whose Stopped hook did. Close is
+// idempotent and returns the same error every time, a panic in the first one
+// included.
 //
 // Close waits for an upstream another goroutine is opening or stopping, and a
 // second Close waits for the first: once any Close returns, every upstream of
@@ -350,7 +353,7 @@ func mustContext(ctx context.Context) {
 // after the other, either order can hang: the stop of the Group closed first
 // can wait on a delivery of the other that a stalled Block subscriber holds
 // up, which only closing the other releases.
-func (g *Group[K, T]) Close() error {
+func (g *Group[K, T]) Close() (err error) {
 	g.mu.Lock()
 	if g.closeDone != nil {
 		done := g.closeDone
@@ -361,25 +364,33 @@ func (g *Group[K, T]) Close() error {
 	done := make(chan struct{})
 	g.closeDone = done // from here Subscribe fails
 	g.mu.Unlock()
-	defer close(done)
-	g.closeErr = g.closeAll()
-	return g.closeErr
+
+	var errs []error
+	defer func() {
+		// Deferred, so that a stop func or Stopped hook that panics still
+		// leaves every other Close the errors of the stops that returned.
+		g.closeErr = errors.Join(errs...)
+		err = g.closeErr
+		close(done)
+	}()
+	g.closeAll(&errs)
+	return nil // replaced by the deferred func
 }
 
 // closeAll stops every upstream of a closing Group, waiting for any that
 // another goroutine is opening or stopping. A stop func or Stopped hook that
 // panics fails Close, but only once the rest are stopped too: Subscribe
 // already fails, so nobody else would stop one that finishes opening
-// afterwards.
-func (g *Group[K, T]) closeAll() error {
+// afterwards. What each stop func returns is added to errs as it returns, so
+// that Close has it even if a later one panics.
+func (g *Group[K, T]) closeAll(errs *[]error) {
 	finished := false
 	defer func() {
 		if !finished {
-			_ = g.closeAll()
+			g.closeAll(errs)
 		}
 	}()
 
-	var errs []error
 	for {
 		g.mu.Lock()
 		var doomed []*flight[K, T]
@@ -409,11 +420,11 @@ func (g *Group[K, T]) closeAll() error {
 			f.unblock()
 		}
 		endAll(doomed)
-		errs = g.stopAll(doomed, errs)
+		g.stopAll(doomed, errs)
 		if len(doomed) == 0 {
 			if w == nil {
 				finished = true
-				return errors.Join(errs...)
+				return
 			}
 			<-w
 		}
@@ -444,19 +455,18 @@ func endAll[K comparable, T any](doomed []*flight[K, T]) {
 // stopAll stops the flights Close has claimed. A stop func or Stopped hook
 // that panics fails Close, but only once the rest are stopped too: nobody
 // else will stop an upstream Close has claimed.
-func (g *Group[K, T]) stopAll(doomed []*flight[K, T], errs []error) []error {
+func (g *Group[K, T]) stopAll(doomed []*flight[K, T], errs *[]error) {
 	next := 0
 	defer func() {
 		if next < len(doomed) {
-			g.stopAll(doomed[next:], nil)
+			g.stopAll(doomed[next:], errs)
 		}
 	}()
 	for next < len(doomed) {
 		f := doomed[next]
 		next++
-		errs = append(errs, g.doStop(f, ErrGroupClosed))
+		*errs = append(*errs, g.doStop(f, ErrGroupClosed))
 	}
-	return errs
 }
 
 // subscribe joins s to key. ctx is nil for the methods that take none, which
@@ -510,8 +520,8 @@ func (g *Group[K, T]) acquire(ctx context.Context, done <-chan struct{}, key K, 
 		g.mu.Lock()
 		// Those who waited for an open share how it went: an error its Source
 		// returned, or an end it came to while opening, which they join rather
-		// than each opening the key again. Pending kept it from being stopped
-		// before they could.
+		// than each opening the key again. Pending keeps it from being stopped
+		// or taken over before they have.
 		shared := waited
 		if waited != nil {
 			// No longer pending on it: whatever happens next, joining it
@@ -572,10 +582,13 @@ func (g *Group[K, T]) acquire(ctx context.Context, done <-chan struct{}, key K, 
 				return nil, err
 			}
 
-		case f.ended.Load() && f != shared:
+		case f.ended.Load() && f != shared && f.pending == 0:
 			// Stop an upstream that ended by itself before opening its
 			// successor, so open never overtakes stop for the same key. Inline
 			// on this goroutine, so the next pass opens straight afterwards.
+			// Not while callers that waited on its open have yet to join it: a
+			// caller that gets here before them joins it too, rather than have
+			// each of them find it stopping and open the key again.
 			g.claimLocked(f)
 			g.mu.Unlock()
 			_ = g.doStop(f, nil)
@@ -732,7 +745,9 @@ func (g *Group[K, T]) giveUpWaiting(f *flight[K, T]) {
 	}
 	g.mu.Lock()
 	f.pending--
-	claimed := g.idleLocked(f)
+	// Not once a Close has begun: that stops f, and returns what its stop
+	// func does, which this caller has nowhere to return.
+	claimed := g.closeDone == nil && g.idleLocked(f)
 	g.mu.Unlock()
 
 	if claimed {
@@ -744,7 +759,9 @@ func (g *Group[K, T]) giveUpWaiting(f *flight[K, T]) {
 // subscribed and nobody is waiting to join, it arms the linger timer, or
 // claims f and reports that the caller must stop it. It reports false when
 // f is still wanted or is already being stopped, by a Close, a takeover or
-// the timer. g.mu must be held.
+// the timer. Only a live f lingers: one still opening is about to be handed
+// to whoever opened it, and a timer armed then would stop it under them.
+// g.mu must be held.
 func (g *Group[K, T]) idleLocked(f *flight[K, T]) bool {
 	if f.refs > 0 || f.pending > 0 {
 		return false

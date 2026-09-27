@@ -242,14 +242,15 @@ func (s *Subscription[T]) Wait(ctx context.Context, after time.Time) (v T, at ti
 //
 // It returns nil when ctx is done and nil when the upstream ended cleanly,
 // which are the two ordinary ways a relay finishes: the client went away, or
-// there is nothing left to send. Once ctx is done it calls send no more, even
-// with values queued, and it takes an error from a send that was in progress
-// as ctx ended for the client going away too. Otherwise it returns the first
-// error send returned, or why the subscription ended: [ErrClosed] when another
-// goroutine closed it, [ErrEvicted], [ErrGroupClosed], or the error the
-// upstream ended with. Values already queued when the upstream ended are sent
-// before that. Use [Subscription.Err] to tell a client that went away from a
-// clean end.
+// there is nothing left to send. It looks at ctx before it takes each value,
+// so once it has seen ctx done it takes and sends no more, leaving what is
+// queued for the next Drain. A value it took as ctx ended is still sent, and
+// it takes an error from that send, or from one in progress as ctx ended, for
+// the client going away too. Otherwise it returns the first error send
+// returned, or why the subscription ended: [ErrClosed] when another goroutine
+// closed it, [ErrEvicted], [ErrGroupClosed], or the error the upstream ended
+// with. Values already queued when the upstream ended are sent before that.
+// Use [Subscription.Err] to tell a client that went away from a clean end.
 //
 // send runs on the caller's goroutine, one value at a time, so it may block: no
 // other subscriber of the key waits for it, and this subscription's [Overflow]
@@ -298,10 +299,11 @@ func (s *Subscription[T]) Drain(ctx context.Context, send func(T) error) error {
 	}
 }
 
-// Close ends the subscription and releases its hold on the upstream. The last
-// Close of a key stops the upstream, unless the Group lingers, and returns the
-// error of stop when this Close is what stopped it. Close is idempotent and
-// returns the same error every time.
+// Close ends the subscription and releases its hold on the upstream. A Close
+// that leaves the upstream with nobody subscribed and nobody waiting to join
+// it stops the upstream, unless the Group lingers, and returns the error of
+// stop when this Close is what stopped it. Close is idempotent and returns the
+// same error every time.
 //
 // It takes the key's lock, so it waits for a delivery in progress on the key,
 // which a [Block] subscriber that has stopped reading holds up until it reads

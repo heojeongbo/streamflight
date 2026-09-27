@@ -16,7 +16,8 @@
 //
 // An upstream can also end by itself through [Emitter.End]. Every subscriber is
 // then closed with the error it ended with, and the next subscriber opens a
-// fresh upstream.
+// fresh upstream, unless the upstream ended as it opened: those waiting on the
+// open, and any who arrive before they have joined it, share that end.
 //
 // A Group need not have many keys. One upstream shared by whoever wants it,
 // opened by the first and stopped after the last, is a Group[struct{}, T]
@@ -71,8 +72,9 @@
 // # Guarantees
 //
 //   - One upstream per key: concurrent subscribers of a key open it once, and it
-//     is stopped once. Those waiting on an open share how it went, whether its
-//     Source failed or the upstream ended as it opened.
+//     is stopped once. Those waiting on an open share how it went: an error
+//     its Source returned, or an end the upstream came to as it opened, which
+//     anyone arriving before they have joined it shares too.
 //   - Open and stop are serialized: a key is never re-opened before its previous
 //     upstream has been stopped.
 //   - Values reach every subscriber of a key in the order they were emitted, and
@@ -123,25 +125,29 @@
 //   - A stop func must return. Its key is unavailable until it does, and
 //     [Group.Close], which stops keys one at a time, waits for it before it
 //     stops the next. Outside Close, no other key is held up by it. Close
-//     also ends every key it stops before it runs any of their stops, and so
-//     waits first for each of their deliveries in progress: a delivery must
-//     not wait on anything that only a stop in the same Group would release.
+//     also ends every key it finds running before it runs any of their stops,
+//     and so waits first for each of their deliveries in progress: a delivery
+//     must not wait on anything that only a stop in the same Group would
+//     release. A key another goroutine is opening or stopping as Close begins
+//     is ended and stopped once that is done, after those stops.
 //   - Subscribe waits while another goroutine is opening or stopping the same
 //     key. It never waits for another key's Source or stop func.
 //     [Group.SubscribeContext] and its siblings stop waiting, on that and on
 //     a delivery that holds the key's lock, once their context is done,
-//     except while they stop an upstream that ended by itself.
+//     except while they stop an upstream: one that ended by itself, or one
+//     that giving up left with nobody, as a last subscriber leaving would.
 //   - The Joined and Left hooks run under a lock shared by the whole Group, so
 //     that their counts are reported in order. Keep them short, and do not
 //     call back into the Group from any hook. Opened and Stopped run with no
-//     lock held, and Dropped, Evicted and Ended under the key's lock. Hooks of
-//     different kinds may run concurrently, for one key as for different
-//     keys.
+//     lock held, and Dropped, Evicted and Ended under the key's lock. So
+//     Joined and Left are never called at once, nor Dropped, Evicted and
+//     Ended for one upstream; beyond that, hooks may run concurrently, of
+//     one kind for different keys as of different kinds for one key.
 //   - Always Close a Subscription, including one that has already ended. An
-//     upstream is stopped when all of its subscriptions are closed (after
-//     [Group.Linger], unless it has ended), when the Group is closed, or, once
-//     it has ended by itself, when the next subscriber of its key arrives to
-//     open a fresh one.
+//     upstream is stopped when all of its subscriptions are closed and nobody
+//     is waiting to join it (after [Group.Linger], unless it has ended), when
+//     the Group is closed, or, once it has ended by itself, when the next
+//     subscriber of its key arrives to open a fresh one.
 //   - A panic in the caller's code, whether a hook, [Group.Initial],
 //     [Group.Now], a SubscribeFunc function, a Source or a stop func, fails the
 //     call it ran in: the Group is not left locked, and nobody is left waiting

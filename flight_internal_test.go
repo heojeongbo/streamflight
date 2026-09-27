@@ -49,8 +49,8 @@ func TestHelpPassesOverACallerThatGaveUp(t *testing.T) {
 // An End that comes once a stop has begun is the Group stopping the key, not
 // the upstream ending by itself: Close begins every stop before it ends any
 // key, and a key fed by another can end in reply before its own end comes.
-// The window is too narrow to hit reliably from outside, so the stop's first
-// step is taken by hand.
+// The window is narrow from outside, so the stop's first step is taken by
+// hand here.
 func TestEndOnceAStopHasBegunIsNotEnded(t *testing.T) {
 	x := require.New(t)
 	ended := 0
@@ -156,6 +156,93 @@ func TestEvictionClearsWhatItMovesPast(t *testing.T) {
 	for _, s := range append(subs, keep) {
 		x.NoError(s.Close())
 	}
+}
+
+// Of two Ends, the one that finishes the flight reports it, even when the
+// other closed quit first: that other finds the flight ended and does
+// nothing, and Ended would otherwise not be reported at all.
+func TestEndsRacingAreEndedOnce(t *testing.T) {
+	x := require.New(t)
+	ended := 0
+	g := &Group[string, int]{
+		Source: func(string, Emitter[int]) (func() error, error) { return nil, nil },
+		Hooks: Hooks[string, int]{
+			Ended: func(string, error) { ended++ },
+		},
+	}
+	s, err := g.Subscribe("k")
+	x.NoError(err)
+	f := g.flights["k"]
+
+	f.quitOnce.Do(f.endByItself) // the first End, before it has mu
+	f.End(errors.New("second"))  // the second, which gets mu first
+	x.Equal(1, ended, "reported by the End that finished it")
+	f.End(errors.New("first")) // the first, resuming
+	x.Equal(1, ended)
+	x.EqualError(s.Err(), "second")
+	x.NoError(s.Close())
+}
+
+// A caller that did not wait on an open, reaching the key before those that
+// did, joins an upstream that ended as it opened rather than taking it over:
+// otherwise each of them would find it stopping and open the key again.
+func TestNewcomerSharesAnEndOthersWaitOn(t *testing.T) {
+	x := require.New(t)
+	opens, stops := 0, 0
+	g := &Group[string, int]{
+		Source: func(_ string, e Emitter[int]) (func() error, error) {
+			opens++
+			e.End(errors.New("refused"))
+			return func() error { stops++; return nil }, nil
+		},
+	}
+	a, err := g.Subscribe("k")
+	x.NoError(err)
+	f := g.flights["k"]
+
+	g.mu.Lock()
+	f.pending++ // a caller that waited on the open, not back for the lock yet
+	g.mu.Unlock()
+	c, err := g.Subscribe("k") // one that did not wait, first to the lock
+	x.NoError(err)
+	x.Equal(1, opens, "joined, not opened again")
+	x.EqualError(c.Err(), "refused")
+
+	x.NoError(a.Close())
+	x.NoError(c.Close())
+	x.Zero(stops, "kept for the caller about to join")
+	g.giveUpWaiting(f)
+	x.Equal(1, stops)
+}
+
+// A caller that gives up on an open once a Close has begun leaves the stop to
+// Close, which returns what the stop func does: the caller would have nowhere
+// to return it.
+func TestGivingUpOnceCloseHasBegun(t *testing.T) {
+	x := require.New(t)
+	failed := errors.New("stop failed")
+	g := &Group[string, int]{
+		Source: func(string, Emitter[int]) (func() error, error) {
+			return func() error { return failed }, nil
+		},
+	}
+	s, err := g.Subscribe("k")
+	x.NoError(err)
+	f := g.flights["k"]
+	g.mu.Lock()
+	f.pending++ // a caller waiting to join
+	g.mu.Unlock()
+	x.NoError(s.Close(), "nothing stopped while it waits")
+
+	g.mu.Lock()
+	g.closeDone = make(chan struct{}) // as Close does first
+	g.mu.Unlock()
+	g.giveUpWaiting(f)
+	x.Equal(live, f.st, "left for Close")
+
+	var errs []error
+	g.closeAll(&errs)
+	x.ErrorIs(errors.Join(errs...), failed)
 }
 
 // arrivedWithTheEnd is a key on which a value arrives and the subscription

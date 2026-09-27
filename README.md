@@ -51,9 +51,9 @@ Then subscribe. Which way depends on what is done with each value:
 
 A handler that relays one key to one client is `Subscribe` and `Drain`, here
 `SubscribeContext`, so that a client that goes away while another client is
-opening the key, or while a stalled delivery holds it, is not waited for. The
-client that opens the key still waits for its `Source`, which takes no
-context:
+opening the key, or while a stalled delivery holds it, is not waited for. It
+still waits for code that takes no context: the `Source` of a key it opens, and
+the `stop` of one it leaves with nobody as it goes:
 
 ```go
 func (s *Server) Watch(req *Request, stream grpc.ServerStreamingServer[Status]) error {
@@ -227,7 +227,9 @@ subscriber leaves, so a reloaded page reuses it instead of opening it again.
 
 **Upstreams that end.** A Source calls `Emitter.End` when its upstream ends by
 itself. Every subscriber is closed with that error, and the next subscriber
-opens a fresh upstream.
+opens a fresh upstream. One that ended as it opened is the exception: those
+waiting on the open, and any who arrive before they have joined it, share that
+end rather than each opening it again.
 
 **One key.** A Group need not have many. One upstream shared by whoever wants
 it, such as a socket or a device, is a `Group[struct{}, T]` subscribed to with
@@ -242,8 +244,9 @@ gauge per key that outlives an upstream's end, count their calls instead.
 ## Guarantees
 
 - **One upstream per key.** Concurrent subscribers of a key open it once, and it
-  is stopped once. Those waiting on an open share how it went, whether its
-  `Source` failed or the upstream ended as it opened.
+  is stopped once. Those waiting on an open share how it went: an error its
+  `Source` returned, or an end the upstream came to as it opened, which anyone
+  arriving before they have joined it shares too.
 - **Open and stop are serialized.** A key is never re-opened before its previous
   upstream has been stopped.
 - **In order, one at a time.** Values reach every subscriber in the order they
@@ -284,14 +287,17 @@ gauge per key that outlives an upstream's end, count their calls instead.
   their own key or close the Group — a key is held from the moment it starts
   opening until its `stop` has returned, so either call would wait for itself.
 - A `stop` must return: its key is unavailable until it does, and `Close`
-  waits for it. `Close` ends every key before running any of their stops, and
-  so waits first for each key's delivery in progress: a delivery must not wait
-  on anything that only a stop in the same Group would release.
+  waits for it. `Close` ends every key it finds running before it runs any of
+  their stops, and so waits first for each of their deliveries in progress: a
+  delivery must not wait on anything that only a stop in the same Group would
+  release.
 - Groups that feed one another must be closed together, each `Close` on its
   own goroutine. Closed one after the other, either order can hang.
 - Hooks must not call back into the Group. `Joined` and `Left` run under a lock
-  shared by the whole Group, so keep them short. Hooks of different kinds can
-  run at once, for one key as for different keys.
+  shared by the whole Group, so keep them short. They are never called at
+  once, nor `Dropped`, `Evicted` and `Ended` for one upstream; beyond that,
+  hooks can run at once, of one kind for different keys as of different kinds
+  for one key.
 - A panic in your code fails the call it ran in. The Group is not left locked
   and nobody is left waiting on a key. A key whose `Opened`, `Joined` or `Left`
   hook panicked may run until its next subscriber leaves (and then its `Linger`

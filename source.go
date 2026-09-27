@@ -33,10 +33,13 @@ type Emitter[T any] interface {
 
 	// End ends the upstream by itself. Every subscriber is closed with err, or
 	// io.EOF if err is nil, and the next subscriber of the key opens a fresh
-	// upstream. The stop func is still called, at the first of: the last
-	// subscriber closing, or the end of Group.Linger if none was left when End
-	// was called; the next subscriber of the key arriving; and the Group being
-	// closed. Emit and End after the first End do nothing.
+	// upstream. One that arrives while the Source is still running, or before
+	// those waiting on the open have joined it, is not the next: it shares the
+	// end, as those waiting on an open share how it went. The stop func is
+	// still called, at the first of: the last subscriber closing, or the end of
+	// Group.Linger if none was left when End was called; the next subscriber of
+	// the key arriving; and the Group being closed. Emit and End after the
+	// first End do nothing.
 	End(err error)
 }
 
@@ -46,12 +49,14 @@ type Emitter[T any] interface {
 // run is started on its own goroutine when the key is opened. Stopping the key
 // cancels ctx and waits for run to return, so run must return once ctx is
 // done: a read that does not take a context is unblocked by closing what it
-// reads, as in context.AfterFunc(ctx, func() { conn.Close() }). If run returns
-// while ctx is still live, the upstream ends with the returned error; see
-// [Emitter.End]. What it returns once ctx is done is discarded, so stopping
-// never fails: a read unblocked by closing what it reads returns an error on
-// every ordinary stop. A cleanup that can fail belongs in a Source that wraps
-// Run, in a stop func that calls the one Run returned and then does it.
+// reads, as in context.AfterFunc(ctx, func() { conn.Close() }). When run
+// returns, the upstream ends with what it returned; see [Emitter.End]. Unless
+// the Group is stopping the key by then: what run returns then is discarded,
+// so stopping never fails, as a read unblocked by closing what it reads
+// returns an error on every ordinary stop. A cleanup that can fail belongs in
+// a Source that wraps Run, in a stop func that calls the one Run returned and
+// then does it. A Source that calls that stop func itself, as one whose setup
+// after Run fails must, ends the upstream with what run returns.
 //
 // Setup that can fail, or that depends on the key, belongs in a Source that
 // does it and then returns Run(run)(key, e). The two fail differently: an
@@ -70,7 +75,8 @@ func Run[K comparable, T any](run func(ctx context.Context, key K, e Emitter[T])
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			// A no-op once the key is stopping, which is when ctx is done.
+			// A no-op once the Group is stopping the key, which it does
+			// before it cancels ctx.
 			e.End(run(ctx, key, e))
 		}()
 
@@ -100,8 +106,9 @@ func Run[K comparable, T any](run func(ctx context.Context, key K, e Emitter[T])
 // nothing: a key it opens keeps what its Source emits while opening.
 //
 // A tick that returns an error ends the upstream with it, closing every
-// subscriber; the next subscriber opens a fresh one. As for [Run], an error
-// returned once the key is stopping is discarded. To make a failure a value
+// subscriber; the next subscriber opens a fresh one, as [Emitter.End] says. As
+// for [Run], an error returned once the Group is stopping the key is
+// discarded. To make a failure a value
 // instead, which is usually right for a backend expected to come back, emit it
 // and return nil: ending the stream would turn one outage into a reconnect
 // loop. A tick with nothing to report simply does not emit.

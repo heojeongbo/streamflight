@@ -19,6 +19,9 @@ type flight[K comparable, T any] struct {
 	// a Block subscriber gives up before the ending needs mu.
 	quit     chan struct{}
 	quitOnce sync.Once
+	// byItself says that an End closed quit, before any stop had begun. Set
+	// within quitOnce, so read after it.
+	byItself bool
 
 	// Guarded by g.mu. pending counts the callers waiting for f to finish
 	// opening so as to join it: while any are, f is not stopped for having no
@@ -227,14 +230,12 @@ func (f *flight[K, T]) End(err error) {
 		err = io.EOF
 	}
 	// Ended by itself only if nothing was stopping it yet: once a stop has
-	// begun, as Close's begins for every key before ending any, an upstream
-	// that ends in reply, such as one fed by a key Close ended first, is the
-	// Group stopping it.
-	first := false
-	f.quitOnce.Do(func() {
-		first = true
-		close(f.quit)
-	})
+	// begun, as Close's begins for every key it finds running before ending
+	// any, an upstream that ends in reply, such as one fed by a key Close
+	// ended first, is the Group stopping it. Of two Ends, the one that
+	// finishes the flight reports it, which need not be the one that closed
+	// quit.
+	f.quitOnce.Do(f.endByItself)
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -242,7 +243,7 @@ func (f *flight[K, T]) End(err error) {
 		f.finish(err)
 		// Under mu, so that it is reported before Stopped: stopping takes mu
 		// to see whether the flight has already ended.
-		if first && f.g.Hooks.Ended != nil {
+		if f.byItself && f.g.Hooks.Ended != nil {
 			f.g.Hooks.Ended(f.key, err)
 		}
 	}
@@ -255,6 +256,12 @@ func (f *flight[K, T]) endClosed() {
 	if !f.done {
 		f.finish(ErrGroupClosed)
 	}
+}
+
+// endByItself closes quit for an End that came before any stop.
+func (f *flight[K, T]) endByItself() {
+	f.byItself = true
+	close(f.quit)
 }
 
 // unblock lets an Emit waiting on a Block subscriber go.
