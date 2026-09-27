@@ -63,13 +63,14 @@ type flight[K comparable, T any] struct {
 	helping     bool
 
 	// mu guards the fields below and is held for every delivery.
-	mu     sync.Mutex
-	subs   []*Subscription[T]
-	ring   []T // the latest values, for Replay
-	head   int // where the next value goes in ring
-	count  int // how many values ring holds
-	done   bool
-	endErr error
+	mu       sync.Mutex
+	subs     []*Subscription[T] // those delivered to
+	samplers []*Subscription[T] // kept apart: a value costs them nothing
+	ring     []T                // the latest values, for Replay
+	head     int                // where the next value goes in ring
+	count    int                // how many values ring holds
+	done     bool
+	endErr   error
 }
 
 // locker is a caller waiting for a flight's mu while it can still give up.
@@ -176,7 +177,7 @@ func (f *flight[K, T]) Emit(v T) int {
 		f.latestMu.Unlock()
 	}
 
-	n := 0
+	n := len(f.samplers) // each has the value, stored above
 	for i, s := range f.subs {
 		switch f.push(s, v, s.overflow) {
 		case accepted:
@@ -294,7 +295,10 @@ func (f *flight[K, T]) finish(err error) {
 	for _, s := range f.subs {
 		s.end(err)
 	}
-	f.subs = nil
+	for _, s := range f.samplers {
+		s.end(err)
+	}
+	f.subs, f.samplers = nil, nil
 	f.ring = nil
 	f.count = 0
 }
@@ -340,7 +344,11 @@ func (f *flight[K, T]) attach(done <-chan struct{}, s *Subscription[T]) bool {
 		f.evict(s)
 		return true
 	}
-	f.subs = append(f.subs, s)
+	if s.kind == sampled {
+		f.samplers = append(f.samplers, s)
+	} else {
+		f.subs = append(f.subs, s)
+	}
 	return true
 }
 
@@ -442,12 +450,16 @@ func (f *flight[K, T]) leave(s *Subscription[T]) error {
 	f.mu.Lock()
 	select {
 	case <-s.done:
-		// Ended already, which takes a subscriber out of f.subs or never puts
-		// it in: evicted, or ended with its key. No need to look for it, which
-		// after a mass eviction would make closing them all quadratic.
+		// Ended already, which takes a subscriber out of its list or never
+		// puts it in: evicted, or ended with its key. No need to look for it,
+		// which after a mass eviction would make closing them all quadratic.
 	default:
-		if i := slices.Index(f.subs, s); i >= 0 {
-			f.subs = slices.Delete(f.subs, i, i+1)
+		list := &f.subs
+		if s.kind == sampled {
+			list = &f.samplers
+		}
+		if i := slices.Index(*list, s); i >= 0 {
+			*list = slices.Delete(*list, i, i+1)
 			s.end(ErrClosed)
 		}
 	}
@@ -488,8 +500,8 @@ func (f *flight[K, T]) push(s *Subscription[T], v T, policy Overflow) outcome {
 		s.fn(v)
 		return accepted
 	case sampled:
-		// Emit already stored the value for the whole key, so there is
-		// nothing to hand this one.
+		// What Replay and Initial send as a sampler joins: the key keeps its
+		// newest value from what is emitted, not from what is caught up on.
 		return accepted
 	}
 

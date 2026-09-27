@@ -2,6 +2,7 @@ package streamflight
 
 import (
 	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -155,4 +156,54 @@ func TestEvictionClearsWhatItMovesPast(t *testing.T) {
 	for _, s := range append(subs, keep) {
 		x.NoError(s.Close())
 	}
+}
+
+// arrivedWithTheEnd is a key on which a value arrives and the subscription
+// ends between Wait finding nothing new and Wait selecting, so that both are
+// ready to select by then.
+type arrivedWithTheEnd struct {
+	calls int
+	newer chan struct{}
+	at    time.Time
+}
+
+func (o *arrivedWithTheEnd) leave(*Subscription[int]) error { return nil }
+func (o *arrivedWithTheEnd) latest() (int, time.Time, bool) { return 7, o.at, true }
+func (o *arrivedWithTheEnd) latestAfter(time.Time) (int, time.Time, bool, <-chan struct{}) {
+	o.calls++
+	if o.calls%2 == 1 {
+		return 0, time.Time{}, false, o.newer
+	}
+	return 7, o.at, true, nil
+}
+
+// A Wait that finds the end and a newer value both ready returns the value,
+// whichever select picks: the subscription has not ended with no such value.
+func TestWaitSeesAValueThatArrivedWithTheEnd(t *testing.T) {
+	x := require.New(t)
+	o := &arrivedWithTheEnd{newer: make(chan struct{}), at: time.Unix(1, 0)}
+	close(o.newer)
+	s := newSubscription[int](sampled, nil, nil, DropOldest)
+	s.owner = o
+	close(s.done)
+
+	for range 100 { // select would pick the end about half the time
+		v, at, ok := s.Wait(t.Context(), time.Time{})
+		x.True(ok)
+		x.Equal(7, v)
+		x.Equal(o.at, at)
+	}
+}
+
+// end makes why a subscription ended visible before it closes the queue, so a
+// reader ranging over C finds the reason as soon as C closes. The two closes
+// are too close together for a race to tell their order, so the queue is
+// closed beforehand and end's own close of it panics: why must be out by then.
+func TestEndPublishesWhyBeforeClosingTheQueue(t *testing.T) {
+	x := require.New(t)
+	s := newSubscription[int](queued, nil, make(chan int, 1), DropOldest)
+	close(s.ch)
+
+	x.Panics(func() { s.end(io.EOF) })
+	x.ErrorIs(s.Err(), io.EOF)
 }

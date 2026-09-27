@@ -14,6 +14,7 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+	"weak"
 
 	"github.com/stretchr/testify/require"
 
@@ -118,7 +119,10 @@ func drain(c <-chan int) []int {
 
 // returns runs f and fails the test if f has not returned within a few
 // seconds, which is what a wedged Group looks like from outside. It fails
-// rather than hangs, so a regression names itself.
+// rather than hangs, so a regression names itself. Not in a synctest bubble,
+// though: there a wait on a mutex does not let the clock move, so only a wait
+// on a channel turns into a failure, and a wedge on a lock hangs until the
+// test binary times out.
 func returns(t *testing.T, f func()) {
 	t.Helper()
 	done := make(chan struct{})
@@ -135,9 +139,13 @@ func returns(t *testing.T, f func()) {
 
 // helping reports whether a goroutine is waiting for a key's lock on behalf of
 // a Context subscribe that found it held.
-func helping() bool {
+func helping() bool { return running(").help(") > 0 }
+
+// running counts the goroutines that are in a call to fn, named as a stack
+// trace shows it, such as ").expire(" for a Linger timer that has fired.
+func running(fn string) int {
 	buf := make([]byte, 1<<20)
-	return strings.Contains(string(buf[:runtime.Stack(buf, true)]), ").help(")
+	return strings.Count(string(buf[:runtime.Stack(buf, true)]), fn)
 }
 
 // eventually fails the test unless cond comes true within a few seconds.
@@ -293,6 +301,24 @@ func TestOpenAndStopErrors(t *testing.T) {
 		x.ErrorIs(b.Close(), boom)
 		x.Equal([]string{"open k", "stop k"}, r.Log())
 	})
+	t.Run("a closed subscription does not keep what its stopped upstream held", func(t *testing.T) {
+		x := require.New(t)
+		var held weak.Pointer[[1 << 16]byte]
+		g := &streamflight.Group[string, int]{
+			Source: func(string, streamflight.Emitter[int]) (func() error, error) {
+				conn := new([1 << 16]byte) // what a stop closes: a connection, a buffer
+				held = weak.Make(conn)
+				return func() error { conn[0] = 1; return nil }, nil
+			},
+		}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		x.NoError(s.Close())
+		runtime.GC()
+		x.Nil(held.Value(), "its stop has been called and is not called again")
+		runtime.KeepAlive(s) // held, as a caller that reads Err or Latest later does
+	})
 }
 
 func TestSubscription(t *testing.T) {
@@ -399,6 +425,68 @@ func TestDrain(t *testing.T) {
 			return nil
 		}))
 		x.Equal([]int{1, 2, 3}, got)
+	})
+	t.Run("once the context is done it sends nothing more, and loses nothing", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.Subscribe("k", streamflight.WithBuffer(8))
+		x.NoError(err)
+		defer s.Close()
+		r.emit("k", 1, 2)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		for range 100 { // select alone would pick the queue about half the time
+			x.NoError(s.Drain(ctx, func(int) error {
+				x.Fail("sent to a client that is gone")
+				return nil
+			}))
+		}
+
+		again, stop := context.WithCancel(context.Background())
+		var got []int
+		x.NoError(s.Drain(again, func(v int) error {
+			got = append(got, v)
+			if len(got) == 2 {
+				stop()
+			}
+			return nil
+		}))
+		x.Equal([]int{1, 2}, got, "what was queued waits for the next Drain")
+	})
+	t.Run("a context that ends while it waits ends it", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			g := &streamflight.Group[string, int]{Source: newRecorder().Source}
+			s, err := g.Subscribe("k")
+			x.NoError(err)
+			defer s.Close()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() { done <- s.Drain(ctx, func(int) error { return nil }) }()
+			synctest.Wait() // waiting on an empty queue
+			cancel()
+			x.NoError(<-done)
+		})
+	})
+	t.Run("a send that fails because the client went away is not a failure", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{Source: r.Source}
+
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		defer s.Close()
+		r.emit("k", 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		x.NoError(s.Drain(ctx, func(int) error {
+			cancel()
+			return context.Canceled // as a stream's write does once its client has gone
+		}))
 	})
 	t.Run("an upstream that ends cleanly is not a failure", func(t *testing.T) {
 		x := require.New(t)
@@ -540,6 +628,35 @@ func TestSubscribeLatest(t *testing.T) {
 		v, _, ok := s.Latest()
 		x.True(ok, "kept without Replay, which does not reach a sampler anyway")
 		x.Equal(42, v)
+	})
+	t.Run("Replay and Initial give a sampler nothing, and each value is counted for it", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[string, int]{
+			Source:  r.Source,
+			Replay:  2,
+			Initial: func(_ string, send func(int)) { send(9) },
+		}
+
+		var keep collector
+		k, err := g.SubscribeFunc("k", keep.Add)
+		x.NoError(err)
+		r.emit("k", 1, 2)
+
+		s, err := g.SubscribeLatest("k")
+		x.NoError(err)
+		_, _, ok := s.Latest()
+		x.False(ok, "a key someone else opened has nothing to sample until its next value")
+
+		x.Equal(2, r.emit("k", 3), "a sampler takes every value")
+		v, _, ok := s.Latest()
+		x.True(ok)
+		x.Equal(3, v)
+
+		x.NoError(s.Close())
+		x.Equal(1, r.emit("k", 4), "one that has left takes none")
+		x.Equal([]int{9, 1, 2, 3, 4}, keep.Values())
+		x.NoError(k.Close())
 	})
 	t.Run("Poll's first tick reaches a sampler that opened the key", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -1421,6 +1538,76 @@ func TestMisuse(t *testing.T) {
 }
 
 func TestLinger(t *testing.T) {
+	// Not in a synctest bubble, where waiting for the Group's lock does not let
+	// the clock move: these need a timer that fires while the lock is held.
+	t.Run("a subscriber back as the timer fires keeps the upstream", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		joins := 0
+		g := &streamflight.Group[string, int]{
+			Source: r.Source,
+			Linger: 20 * time.Millisecond,
+			Hooks: streamflight.Hooks[string, int]{
+				Joined: func(string, int) {
+					if joins++; joins == 2 {
+						// The Group's lock is held: let the timer fire and
+						// reach it before this subscriber has joined.
+						eventually(t, func() bool { return running(").expire(") > 0 }, "the timer fires")
+					}
+				},
+			},
+		}
+
+		a, err := g.Subscribe("k")
+		x.NoError(err)
+		x.NoError(a.Close())
+		b, err := g.Subscribe("k")
+		x.NoError(err)
+		eventually(t, func() bool { return running(").expire(") == 0 }, "the timer gives up")
+
+		x.Equal([]string{"open k"}, r.Log(), "the timer was for a subscriber who left, not for b")
+		x.NoError(b.Err())
+		x.Equal(1, r.emit("k", 1))
+		x.NoError(b.Close())
+	})
+	t.Run("a timer that fires as the key is taken over does not stop it again", func(t *testing.T) {
+		x := require.New(t)
+		for range 20 { // whichever of the two gets the Group's lock first
+			r := newRecorder()
+			var g *streamflight.Group[string, int]
+			var next *streamflight.Subscription[int]
+			var took sync.WaitGroup
+			g = &streamflight.Group[string, int]{
+				Source: r.Source,
+				Linger: 20 * time.Millisecond,
+				Hooks: streamflight.Hooks[string, int]{
+					Joined: func(key string, _ int) {
+						if key != "hold" {
+							return
+						}
+						// The Group's lock is held. Queue a subscriber that
+						// takes over the ended key, and let the timer fire.
+						took.Go(func() { next = must(g.Subscribe("k")) })
+						eventually(t, func() bool { return running(").expire(") > 0 }, "the timer fires")
+						time.Sleep(time.Millisecond) // for the subscriber to reach the lock
+					},
+				},
+			}
+
+			a, err := g.Subscribe("k")
+			x.NoError(err)
+			x.NoError(a.Close())
+			r.emitter("k").End(nil) // lingering, and ended: the next subscriber takes it over
+			hold, err := g.Subscribe("hold")
+			x.NoError(err)
+			took.Wait()
+
+			x.NoError(next.Close())
+			x.NoError(hold.Close())
+			x.NoError(g.Close()) // rather than wait out the new upstream's Linger
+			x.Equal(2, strings.Count(strings.Join(r.Log(), ","), "stop k"), "once for each upstream: %v", r.Log())
+		}
+	})
 	t.Run("the upstream stops once it has lingered", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			x := require.New(t)
@@ -1609,7 +1796,7 @@ func TestGroupClose(t *testing.T) {
 		x.ErrorIs(b.Err(), streamflight.ErrGroupClosed)
 		x.True(closed(a.C))
 
-		x.NoError(g.Close(), "idempotent")
+		x.Equal(err, g.Close(), "idempotent, and the same error every time")
 		x.NoError(a.Close(), "already stopped")
 		x.NoError(b.Close())
 		x.Len(r.Log(), 4)
@@ -1648,9 +1835,11 @@ func TestGroupClose(t *testing.T) {
 		x.NoError(<-closed)
 		x.Equal([]string{"open k", "stop k"}, r.Log())
 	})
-	t.Run("a second close waits for the first", func(t *testing.T) {
+	t.Run("a second close waits for the first, and returns what it does", func(t *testing.T) {
 		x := require.New(t)
+		boom := errors.New("boom")
 		r := newRecorder()
+		r.stopErr = boom
 		src, entered, release := gatedStops(r.Source)
 		g := &streamflight.Group[string, int]{Source: src}
 
@@ -1672,8 +1861,8 @@ func TestGroupClose(t *testing.T) {
 		}
 
 		release()
-		x.NoError(<-first)
-		x.NoError(<-second)
+		x.ErrorIs(<-first, boom)
+		x.ErrorIs(<-second, boom, "not nil because another Close ran the stops")
 	})
 	t.Run("a Block subscriber is ended, not refused values, while other keys stop", func(t *testing.T) {
 		for range 10 { // a first or b first
@@ -2030,6 +2219,53 @@ func TestConcurrentOpen(t *testing.T) {
 			x.Equal(1, opens, "one attempt, shared by all of them")
 
 			// The key was given back, so it can be opened again.
+			x.NoError(g.Close())
+		})
+	})
+	t.Run("concurrent subscribers share an upstream that ends as it opens", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			x := require.New(t)
+			boom := errors.New("connection refused")
+			gate := make(chan struct{})
+			opens, stops := 0, 0
+			g := &streamflight.Group[string, int]{
+				// As a Run whose function fails at once does, but in order.
+				Source: func(_ string, e streamflight.Emitter[int]) (func() error, error) {
+					opens++
+					<-gate
+					e.End(boom)
+					return func() error { stops++; return nil }, nil
+				},
+			}
+
+			const n = 8
+			errs, ended := make([]error, n), make([]error, n)
+			var wg sync.WaitGroup
+			for i := range errs {
+				wg.Go(func() {
+					var s *streamflight.Subscription[int]
+					if s, errs[i] = g.Subscribe("k"); s != nil {
+						ended[i] = s.Err()
+						s.Close() // at once, before the others have joined
+					}
+				})
+			}
+			synctest.Wait() // one is in the Source, the rest wait on it
+
+			close(gate)
+			wg.Wait()
+			for i := range errs {
+				x.NoError(errs[i])
+				x.ErrorIs(ended[i], boom, "every one of them learns why it ended")
+			}
+			x.Equal(1, opens, "one attempt, shared by all of them, as a failed open is")
+			x.Equal(1, stops)
+
+			// One that comes afterwards opens it again, as after any end.
+			s, err := g.Subscribe("k")
+			x.NoError(err)
+			x.NoError(s.Close())
+			x.Equal(2, opens)
 			x.NoError(g.Close())
 		})
 	})
@@ -2498,6 +2734,52 @@ func TestSubscribeContext(t *testing.T) {
 		x.NoError(first.Close())
 		x.NoError(stalled.Close())
 		x.Equal([]string{"open k", "stop k"}, r.Log())
+	})
+	t.Run("a caller that gives up as it is handed the lock does not keep it", func(t *testing.T) {
+		x := require.New(t)
+		for range 50 { // it gives up after it is taken off the queue about half the time
+			r := newRecorder()
+			g := &streamflight.Group[string, int]{Source: r.Source}
+			reached := make(chan struct{})
+			first, err := g.SubscribeFunc("k", func(v int) {
+				if v == 2 {
+					close(reached)
+				}
+			})
+			x.NoError(err)
+			stalled, err := g.Subscribe("k", streamflight.WithOverflow(streamflight.Block))
+			x.NoError(err)
+			r.emit("k", 1)
+			go r.emit("k", 2)
+			<-reached // the delivery of 2 holds the key's lock until stalled reads
+
+			ctx, cancel := context.WithCancel(t.Context())
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			var joined []*streamflight.Subscription[int]
+			for range 8 {
+				wg.Go(func() {
+					if s, err := g.SubscribeContext(ctx, "k"); err == nil {
+						mu.Lock()
+						joined = append(joined, s)
+						mu.Unlock()
+					}
+				})
+			}
+			eventually(t, func() bool { return running(").lock(") == 8 }, "the callers are queued")
+			cancel()
+			x.Equal(1, <-stalled.C) // the lock is let go as they give up
+			returns(t, wg.Wait)
+			x.Equal(2, <-stalled.C)
+			returns(t, func() { r.emit("k", 3) }) // nobody who gave up is left holding it
+
+			for _, s := range joined {
+				x.NoError(s.Close())
+			}
+			x.NoError(first.Close())
+			x.NoError(stalled.Close())
+			x.Equal([]string{"open k", "stop k"}, r.Log())
+		}
 	})
 	t.Run("callers queued for a held key give up in any order", func(t *testing.T) {
 		x := require.New(t)

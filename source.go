@@ -48,7 +48,10 @@ type Emitter[T any] interface {
 // done: a read that does not take a context is unblocked by closing what it
 // reads, as in context.AfterFunc(ctx, func() { conn.Close() }). If run returns
 // while ctx is still live, the upstream ends with the returned error; see
-// [Emitter.End].
+// [Emitter.End]. What it returns once ctx is done is discarded, so stopping
+// never fails: a read unblocked by closing what it reads returns an error on
+// every ordinary stop. A cleanup that can fail belongs in a Source that wraps
+// Run, in a stop func that calls the one Run returned and then does it.
 //
 // Setup that can fail, or that depends on the key, belongs in a Source that
 // does it and then returns Run(run)(key, e). The two fail differently: an
@@ -97,7 +100,8 @@ func Run[K comparable, T any](run func(ctx context.Context, key K, e Emitter[T])
 // nothing: a key it opens keeps what its Source emits while opening.
 //
 // A tick that returns an error ends the upstream with it, closing every
-// subscriber; the next subscriber opens a fresh one. To make a failure a value
+// subscriber; the next subscriber opens a fresh one. As for [Run], an error
+// returned once the key is stopping is discarded. To make a failure a value
 // instead, which is usually right for a backend expected to come back, emit it
 // and return nil: ending the stream would turn one outage into a reconnect
 // loop. A tick with nothing to report simply does not emit.

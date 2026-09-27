@@ -206,7 +206,7 @@ up every other subscriber of the key. `Subscribe` queues instead, and its
 |---|---|---|
 | `DropOldest` (default) | discards its oldest value | state, where only the latest matters |
 | `DropNewest` | refuses the arriving value | keeping the start of a burst |
-| `Block` | waits for the subscriber, and so do the `Source` and every other subscriber of the key | lossless delivery to consumers that keep up |
+| `Block` | waits for the subscriber, and so do the `Source`, every other subscriber of the key, and subscribing to it or closing any other subscription of it | lossless delivery to consumers that keep up |
 | `Evict` | closes the subscriber with `ErrEvicted` | deltas, where a gap corrupts everything after it |
 
 With no options the queue holds one value and drops its oldest, which suits
@@ -236,12 +236,14 @@ it, such as a socket or a device, is a `Group[struct{}, T]` subscribed to with
 **Observability.** `Group.Hooks` reports opens, stops, joins, leaves and drops,
 subscribers `Evict` cut off, and upstreams that end by themselves (`Ended`), so
 a failing upstream can be told from a stopped one and a slow consumer from a
-refused value.
+refused value. The count `Joined` and `Left` report is the upstream's: for a
+gauge per key that outlives an upstream's end, count their calls instead.
 
 ## Guarantees
 
 - **One upstream per key.** Concurrent subscribers of a key open it once, and it
-  is stopped once.
+  is stopped once. Those waiting on an open share how it went, whether its
+  `Source` failed or the upstream ended as it opened.
 - **Open and stop are serialized.** A key is never re-opened before its previous
   upstream has been stopped.
 - **In order, one at a time.** Values reach every subscriber in the order they
@@ -254,7 +256,8 @@ refused value.
   values delivered as they are emitted, not for what `Replay` sends a
   subscriber as it joins, which `Latest` may already have moved past.
 - **Nothing after Close.** Once `Close` returns, its subscriber is never
-  delivered to again. A delivery in progress completes first.
+  delivered to again. A delivery in progress on the key completes first, so
+  `Close` waits for one that a `Block` subscriber holds up.
 - **Nothing after the end.** Values emitted after the upstream is stopped or has
   ended are dropped.
 - **Keys are independent.** Opening or stopping one key never waits for
@@ -287,7 +290,8 @@ refused value.
 - Groups that feed one another must be closed together, each `Close` on its
   own goroutine. Closed one after the other, either order can hang.
 - Hooks must not call back into the Group. `Joined` and `Left` run under a lock
-  shared by the whole Group, so keep them short.
+  shared by the whole Group, so keep them short. Hooks of different kinds can
+  run at once, for one key as for different keys.
 - A panic in your code fails the call it ran in. The Group is not left locked
   and nobody is left waiting on a key. A key whose `Opened`, `Joined` or `Left`
   hook panicked may run until its next subscriber leaves (and then its `Linger`
@@ -355,7 +359,8 @@ one per key.
 ## Development
 
 ```sh
-# Check formatting, vet, race-test five times, and fail below 100% coverage.
+# Check formatting and vet, race-test with coverage and then five more times,
+# and fail below 100% coverage.
 $ ./scripts/test.sh
 
 # Race-test more, when chasing something intermittent.

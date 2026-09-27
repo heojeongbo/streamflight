@@ -31,10 +31,12 @@ const (
 
 	// Block waits until the subscriber makes room. Nothing emitted while it is
 	// subscribed is lost, but every other subscriber of the key, and the Source
-	// itself, waits too. Closing the subscription, ending the upstream or
-	// closing the Group releases it: the value it was waiting to deliver is not
-	// delivered, nor is anything emitted after that before the subscriber is
-	// ended, and none of them counts as dropped.
+	// itself, waits too, as does subscribing to the key or closing any other
+	// subscription of it, a sampler's included. Closing the subscription,
+	// ending the upstream or closing the Group releases it: the value it was
+	// waiting to deliver is not delivered, what is emitted after that before
+	// the subscriber is ended is delivered only if its queue has room, never
+	// waited for, and none of what is not delivered counts as dropped.
 	Block
 
 	// Evict closes the subscriber with ErrEvicted. Right when a gap would make
@@ -226,7 +228,10 @@ func (s *Subscription[T]) Wait(ctx context.Context, after time.Time) (v T, at ti
 		case <-ctx.Done():
 			return v, at, false
 		case <-s.done:
-			return v, at, false
+			// A value can have arrived just before the end, readying both
+			// cases, and select picks either. The value is there to see.
+			v, at, ok, _ := s.owner.latestAfter(after)
+			return v, at, ok
 		}
 	}
 }
@@ -237,11 +242,14 @@ func (s *Subscription[T]) Wait(ctx context.Context, after time.Time) (v T, at ti
 //
 // It returns nil when ctx is done and nil when the upstream ended cleanly,
 // which are the two ordinary ways a relay finishes: the client went away, or
-// there is nothing left to send. Otherwise it returns the first error send
-// returned, or why the subscription ended: [ErrClosed] when another goroutine
-// closed it, [ErrEvicted], [ErrGroupClosed], or the error the upstream ended
-// with. Values already queued when the upstream ended are sent before that.
-// Use [Subscription.Err] to tell a client that went away from a clean end.
+// there is nothing left to send. Once ctx is done it calls send no more, even
+// with values queued, and it takes an error from a send that was in progress
+// as ctx ended for the client going away too. Otherwise it returns the first
+// error send returned, or why the subscription ended: [ErrClosed] when another
+// goroutine closed it, [ErrEvicted], [ErrGroupClosed], or the error the
+// upstream ended with. Values already queued when the upstream ended are sent
+// before that. Use [Subscription.Err] to tell a client that went away from a
+// clean end.
 //
 // send runs on the caller's goroutine, one value at a time, so it may block: no
 // other subscriber of the key waits for it, and this subscription's [Overflow]
@@ -263,6 +271,13 @@ func (s *Subscription[T]) Drain(ctx context.Context, send func(T) error) error {
 		panic("streamflight: Drain on a subscription with no channel")
 	}
 	for {
+		// First, so that a client that has gone away is not sent what is
+		// queued: select would pick between the two at random, and a send to a
+		// client that is gone fails. What is left stays queued for the next
+		// Drain.
+		if ctx.Err() != nil {
+			return nil
+		}
 		select {
 		case <-ctx.Done():
 			return nil
@@ -274,6 +289,9 @@ func (s *Subscription[T]) Drain(ctx context.Context, send func(T) error) error {
 				return nil
 			}
 			if err := send(v); err != nil {
+				if ctx.Err() != nil {
+					return nil // the send failed because the client went away
+				}
 				return err
 			}
 		}
@@ -284,6 +302,12 @@ func (s *Subscription[T]) Drain(ctx context.Context, send func(T) error) error {
 // Close of a key stops the upstream, unless the Group lingers, and returns the
 // error of stop when this Close is what stopped it. Close is idempotent and
 // returns the same error every time.
+//
+// It takes the key's lock, so it waits for a delivery in progress on the key,
+// which a [Block] subscriber that has stopped reading holds up until it reads
+// or is closed, the upstream ends or the Group is closed. A derived key's
+// stop, which closes its subscription to the key it is fed from, waits the
+// same way.
 func (s *Subscription[T]) Close() error {
 	s.closeOnce.Do(func() {
 		if s.closing != nil {

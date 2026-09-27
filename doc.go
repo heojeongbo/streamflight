@@ -59,8 +59,9 @@
 // the latest values ([Group.Replay], or [Group.ReplayFor] when it depends on
 // the key) or a snapshot of the current state ([Group.Initial]). A function
 // subscriber is sent them inside SubscribeFunc, on the calling goroutine,
-// before it returns. A sampler keeps neither: Initial is still called for it,
-// but it reads what the key keeps.
+// before it returns, which live values from other goroutines can do as well. A
+// sampler keeps neither: Initial is still called for it, but it reads what the
+// key keeps.
 //
 // A [Source] is written from whatever the upstream is. [Run] makes one out of a
 // loop that produces values until its context is done; [Poll] out of a function
@@ -70,7 +71,8 @@
 // # Guarantees
 //
 //   - One upstream per key: concurrent subscribers of a key open it once, and it
-//     is stopped once.
+//     is stopped once. Those waiting on an open share how it went, whether its
+//     Source failed or the upstream ended as it opened.
 //   - Open and stop are serialized: a key is never re-opened before its previous
 //     upstream has been stopped.
 //   - Values reach every subscriber of a key in the order they were emitted, and
@@ -85,7 +87,8 @@
 //     what Replay sends a subscriber as it joins, which Latest may already
 //     have moved past.
 //   - After [Subscription.Close] returns, its subscriber is never delivered to
-//     again. A delivery in progress completes first.
+//     again. A delivery in progress on the key completes first, so Close waits
+//     for one that a [Block] subscriber holds up.
 //   - Values emitted after the upstream is stopped or has ended are dropped.
 //   - Keys are independent: opening or stopping one key never waits for
 //     another, and neither does a subscriber that has fallen behind, except
@@ -131,8 +134,9 @@
 //   - The Joined and Left hooks run under a lock shared by the whole Group, so
 //     that their counts are reported in order. Keep them short, and do not
 //     call back into the Group from any hook. Opened and Stopped run with no
-//     lock held, Dropped, Evicted and Ended under the key's lock, and every
-//     hook may run concurrently for different keys.
+//     lock held, and Dropped, Evicted and Ended under the key's lock. Hooks of
+//     different kinds may run concurrently, for one key as for different
+//     keys.
 //   - Always Close a Subscription, including one that has already ended. An
 //     upstream is stopped when all of its subscriptions are closed (after
 //     [Group.Linger], unless it has ended), when the Group is closed, or, once

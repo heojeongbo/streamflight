@@ -88,7 +88,8 @@ type Group[K comparable, T any] struct {
 	// Initial, if set, is called for each subscriber that joins a key, after
 	// Replay and before any live value, to send it values no other subscriber
 	// receives, such as a snapshot of the current state for a stream of deltas.
-	// send is valid only during the call: retaining it and calling it later
+	// send is valid only during the call and from one goroutine at a time: it
+	// must not be called concurrently, and retaining it and calling it later
 	// panics.
 	//
 	// No value is emitted during the call, but a value emitted right after it
@@ -124,14 +125,18 @@ type Group[K comparable, T any] struct {
 	mu        sync.Mutex
 	flights   map[K]*flight[K, T]
 	closeDone chan struct{} // non-nil once a Close has started
+	closeErr  error         // what the first Close returns, set before closeDone closes
 }
 
 // Hooks observe a Group. Every field is optional. None may call back into the
-// Group, and all of them may be called concurrently for different keys. Joined
-// and Left run under a lock shared by the whole Group, so their counts arrive
-// in order; keep them short. Dropped and Evicted run under the key's lock,
-// inside the delivery that dropped the value or evicted the subscriber, and
-// Ended under it as the upstream ends.
+// Group. Joined and Left run under a lock shared by the whole Group, so they
+// are never called at once and their counts arrive in order; keep them short.
+// Dropped and Evicted run under the key's lock, inside the delivery that
+// dropped the value or evicted the subscriber, and Ended under it as the
+// upstream ends, so those three are never called at once for one upstream.
+// Beyond that, hooks may be called concurrently, for one key as well as for
+// different keys: a Dropped with a Joined, or the Left of a subscriber of an
+// upstream that has ended with the Opened of the next.
 //
 // A hook that panics fails the call that reported it: the Group is not left
 // locked and nobody is left waiting on a key, but a key whose Opened, Joined
@@ -150,7 +155,8 @@ type Hooks[K comparable, T any] struct {
 	// of its stop func.
 	Stopped func(key K, err error)
 
-	// Joined is called when a subscriber joins key, with how many it has now.
+	// Joined is called when a subscriber joins key, with how many subscribers
+	// the upstream it joins has now.
 	// It is called before the subscriber is sent what Replay and Initial have
 	// for it, so it is not a sign that the subscriber can receive yet, nor
 	// that it will be subscribed at all: one whose Context subscribe gives up
@@ -161,14 +167,20 @@ type Hooks[K comparable, T any] struct {
 
 	// Left is called when a subscriber of key closes, or leaves again without
 	// a subscription after Joined reported it, with how many remain.
+	//
+	// The count is the upstream's, not the key's. A subscriber of an upstream
+	// that ended by itself, closing after the next subscriber has opened a new
+	// one, is counted against the upstream it was on: Left can report 0 while
+	// the key has a subscriber. For a gauge per key, count each Joined as one
+	// up and each Left as one down.
 	Left func(key K, n int)
 
 	// Dropped is called with each value a subscriber of key loses to a full
 	// queue: under DropNewest the arriving value, which Emit did not count;
-	// under DropOldest the queued value it displaced, which an earlier Emit did
-	// count. What Replay and Initial send a joining subscriber is the
-	// exception: under any policy but Evict, a queue too short for it displaces
-	// its oldest, as DropOldest does, and no Emit counted those.
+	// under DropOldest the queued value it displaced, which an earlier Emit
+	// counted unless Replay or Initial sent it as the subscriber joined. No
+	// Emit counts what those send: under any policy but Evict, a queue too
+	// short for it displaces its oldest, as DropOldest does.
 	Dropped func(key K, v T)
 
 	// Evicted is called for each subscriber of key that Evict cuts off, for
@@ -180,14 +192,16 @@ type Hooks[K comparable, T any] struct {
 	// [Emitter.End], with the error its subscribers are closed with: io.EOF
 	// for End(nil). It is called before Stopped reports the same upstream, and
 	// not at all for one the Group had begun to stop, even if an End that came
-	// after is what closed its subscribers. A Source that calls End while it is
-	// opening and then fails the open is reported as Ended and never Stopped:
-	// there was nothing to stop, and nobody subscribed to close.
+	// after is what closed its subscribers. An upstream that ends while its
+	// Source is still running, as one whose [Run] or [Poll] function fails at
+	// once can, is reported by Ended before Opened, and if the Source then
+	// fails, never by Stopped: there was nothing to stop, and nobody
+	// subscribed to close.
 	Ended func(key K, err error)
 }
 
-// Subscribe joins key, opening its upstream if it has no subscriber, and
-// queues its values on the subscription's channel C.
+// Subscribe joins key, opening its upstream unless one is running, and queues
+// its values on the subscription's channel C.
 //
 // With no options the queue holds one value and a full queue drops its oldest
 // ([DropOldest]): right for state, where only the latest matters, and wrong for
@@ -213,8 +227,8 @@ func (g *Group[K, T]) Subscribe(key K, opts ...SubscribeOption) (*Subscription[T
 // runs, waiting first for the key's lock, held while the Ended hook runs. Once
 // those return, it gives back what it took, the way a last subscriber leaving
 // would: stopped at once, which runs the stop func there and then, or after
-// [Group.Linger]. So without Linger, another subscriber that was waiting on the
-// same open may find it stopped, and open it afresh. If the open it ran fails,
+// [Group.Linger], but not while others that waited on the same open have yet
+// to join it. If the open it ran fails,
 // or a Close began while it ran, it returns that error instead, as Subscribe
 // would. Nor does it give up once it has the key's lock: from there it sends
 // what Replay and Initial have for it and joins, returning the subscription
@@ -244,12 +258,13 @@ func (g *Group[K, T]) subscribeQueued(ctx context.Context, key K, opts []Subscri
 	return s, nil
 }
 
-// SubscribeFunc joins key, opening its upstream if it has no subscriber, and
+// SubscribeFunc joins key, opening its upstream unless one is running, and
 // calls fn with each of its values on the goroutine that emitted it. What
 // Replay and Initial have for it is delivered first, on the calling goroutine,
-// before SubscribeFunc returns: a fn that refers to the returned subscription
-// finds it nil for those. fn must not block; see the package documentation.
-// A nil fn panics.
+// before SubscribeFunc returns, and values emitted on other goroutines can
+// reach fn before it returns too. So fn must not use the returned
+// subscription, which it would read as the caller stores it. fn must not
+// block; see the package documentation. A nil fn panics.
 func (g *Group[K, T]) SubscribeFunc(key K, fn func(T)) (*Subscription[T], error) {
 	if fn == nil {
 		panic("streamflight: SubscribeFunc with a nil function")
@@ -287,9 +302,10 @@ func (g *Group[K, T]) subscribeCalled(ctx context.Context, key K, fn func(T)) (*
 // upstream is quiet finds an empty queue, not the value that is still true.
 //
 // It costs the key one stored value however many subscribers sample it, and
-// costs a subscriber no more per value than a step through a loop. A key
-// stores nothing until a sampler starts opening it or joins it, and from then
-// on keeps its newest value until its upstream stops.
+// costs a subscriber nothing per value: an Emit does the same work for one
+// sampler as for a thousand. A key stores nothing until a sampler starts
+// opening it or joins it, and from then on keeps its newest value until its
+// upstream stops.
 //
 // A key a sampler opens keeps what its Source emits while opening, such as the
 // current state it read on subscribing. The first sampler of a key someone
@@ -323,7 +339,7 @@ func mustContext(ctx context.Context) {
 
 // Close stops every upstream, ends every subscription with ErrGroupClosed and
 // makes later Subscribe calls fail with it. It returns the errors of the stop
-// funcs, joined. Close is idempotent.
+// funcs, joined. Close is idempotent and returns the same error every time.
 //
 // Close waits for an upstream another goroutine is opening or stopping, and a
 // second Close waits for the first: once any Close returns, every upstream of
@@ -340,13 +356,14 @@ func (g *Group[K, T]) Close() error {
 		done := g.closeDone
 		g.mu.Unlock()
 		<-done // every upstream has been stopped once any Close returns
-		return nil
+		return g.closeErr
 	}
 	done := make(chan struct{})
 	g.closeDone = done // from here Subscribe fails
 	g.mu.Unlock()
 	defer close(done)
-	return g.closeAll()
+	g.closeErr = g.closeAll()
+	return g.closeErr
 }
 
 // closeAll stops every upstream of a closing Group, waiting for any that
@@ -491,6 +508,11 @@ func (g *Group[K, T]) acquire(ctx context.Context, done <-chan struct{}, key K, 
 			}
 		}
 		g.mu.Lock()
+		// Those who waited for an open share how it went: an error its Source
+		// returned, or an end it came to while opening, which they join rather
+		// than each opening the key again. Pending kept it from being stopped
+		// before they could.
+		shared := waited
 		if waited != nil {
 			// No longer pending on it: whatever happens next, joining it
 			// included, happens in this critical section.
@@ -550,7 +572,7 @@ func (g *Group[K, T]) acquire(ctx context.Context, done <-chan struct{}, key K, 
 				return nil, err
 			}
 
-		case f.ended.Load():
+		case f.ended.Load() && f != shared:
 			// Stop an upstream that ended by itself before opening its
 			// successor, so open never overtakes stop for the same key. Inline
 			// on this goroutine, so the next pass opens straight afterwards.
@@ -761,6 +783,7 @@ func (g *Group[K, T]) doStop(f *flight[K, T], reason error) error {
 		g.mu.Lock()
 		delete(g.flights, f.key)
 		f.st = dead
+		f.stop = nil // called: a subscription still held must not keep what it holds
 		f.wakeLocked()
 		g.mu.Unlock()
 	}()

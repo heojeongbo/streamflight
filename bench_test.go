@@ -172,7 +172,9 @@ func BenchmarkOpenStop(b *testing.B) {
 }
 
 // BenchmarkOpenStopParallel is many goroutines each opening and stopping a key
-// of its own. Distinct keys share nothing, so this should scale with P.
+// of its own. Distinct keys never wait on each other's Source or stop, but
+// every open, join, leave and stop takes the Group's lock briefly, so this
+// measures that lock under contention rather than scaling with P.
 func BenchmarkOpenStopParallel(b *testing.B) {
 	g := &streamflight.Group[int, int]{
 		Source: func(int, streamflight.Emitter[int]) (func() error, error) {
