@@ -1,5 +1,122 @@
 # Changelog
 
+## v0.4.2 — 2026-09-28
+
+A relay that returned its client's write error about half the times the client
+left, callers that each reopened an upstream that failed as it opened, and what
+further reviews found: misuses that were accepted quietly, and documentation
+that promised more or less than the code does. Nothing to rewrite, but a few
+calls that used to be accepted now panic; see *Upgrading*.
+
+### Fixed
+
+- **`Drain` wrote to a client that had gone.** With values queued as its
+  context ended, `select` picked between the two at random, so about half the
+  time `Drain` called `send` once more and returned the error of that write
+  rather than nil: a handler that returns `sub.Drain(stream.Context(),
+  stream.Send)` reported an ordinary disconnect as a failure. `Drain` now
+  looks at the context before it takes each value and leaves what is queued
+  for the next `Drain`, and takes an error from a `send` in progress as the
+  context ended for the client going away too.
+
+- **Callers waiting on an open that ended as it opened each opened the key
+  again.** A `Run` or `Poll` function that fails at once, as on a refused
+  connection, ends the upstream before its `Source` returns. Every waiter then
+  found it ended, stopped it and opened another, one after the other: eight
+  waiters, eight opens. They now share how the open went, as they already
+  shared an error the `Source` returned, each with a subscription ended with
+  that error, and so does a subscriber that arrives before they have joined.
+
+- **A Context subscribe that opened a key and then gave up stopped it under
+  those waiting on it.** With `Linger` at zero, giving its reference back
+  stopped the upstream before the callers waiting on the same open had
+  joined, and they opened it again. An upstream is no longer stopped while
+  callers that waited for it to open have yet to join.
+
+- **`Wait` could miss a value that arrived as the subscription ended**,
+  returning `ok == false` while `Latest` held a newer value.
+
+- **A second `Group.Close` returned nil** where the first returned the errors
+  of the stop funcs, so which caller saw a failed stop depended on which got
+  there first. Every call now returns the same error, as `Subscription.Close`
+  does, and a stop func or `Stopped` hook that panics in the first no longer
+  loses the errors of the stops that returned.
+
+- **A subscription still held kept a stopped upstream's resources alive.** The
+  stop func, and whatever it captured, such as a connection or a buffer,
+  stayed reachable from any subscription still referenced, a sampler kept to
+  read `Latest` after the end among them. It is let go once called.
+
+- **`Hooks.Ended` could report a key `Group.Close` had begun to stop**, when
+  that key ended in reply to another key being closed. It now reports only an
+  end that came before any stop.
+
+- **Misuses that were accepted quietly now panic where they are made**, as
+  `SubscribeFunc(key, nil)` has since v0.4.1: `Run(nil)` and `Poll(d, nil)`,
+  which crashed the program later from the goroutine they start; a nil
+  `SubscribeOption`, which was a bare nil dereference; `Drain` with a nil
+  `send`, which lost the value it had taken; `Wait` with a nil context; and
+  `Drain` on a `Subscription` no Group made, which blocked.
+
+### Performance
+
+- **An `Emit` costs the same however many samplers a key has.** Samplers are
+  kept apart from the subscribers values are delivered to, rather than
+  stepped through one by one under the key's lock:
+
+  | Samplers | before | after |
+  |---:|---:|---:|
+  | 1 | 43 ns | 43 ns |
+  | 10 | 49 ns | 43 ns |
+  | 100 | 175 ns | 43 ns |
+
+- Callers queued for a held key leave the queue in constant time, and closing
+  every subscriber one `Emit` evicted is linear rather than quadratic.
+
+- Joining and leaving a key is 2–6% slower, about 4 ns, for counting the
+  callers waiting on an open and keeping samplers apart.
+
+### Documentation
+
+- `Joined` and `Left` count one upstream's subscribers, not the key's: for a
+  gauge per key that outlives an upstream's end, count their calls. Which
+  hooks are never called at once is spelled out, and `Ended` can come before
+  `Opened`.
+- Closing a subscription waits for a delivery a `Block` subscriber holds up,
+  and so does a derived key's stop. Groups that feed one another must be
+  closed together, and a delivery must not wait on a stop in the same Group.
+- A Context subscribe that gives up can be the one that stops what it leaves
+  with nobody, and runs the stop func before it returns.
+- What a `Run` function returns once the Group is stopping its key is
+  discarded; `Initial`'s `send` is for one goroutine at a time; values
+  emitted on other goroutines can reach a `SubscribeFunc` function before it
+  returns.
+- The README's performance tables are measured again, on an Apple M3 Max.
+
+### Upgrading
+
+`go get github.com/heojeongbo/streamflight@v0.4.2`. Nothing to rewrite. Worth
+a look:
+
+1. Calls given a bad argument now panic where the mistake is made. `Run(nil)`
+   and `Poll(d, nil)` panic when called, not when a key opens: a Source built
+   from a nil function panics even if it is never opened. A nil
+   `SubscribeOption` panics with a message. `Drain` panics on a nil `send`
+   even with nothing to send, and `Wait` on a nil context even with a value
+   there to return. `Drain` on a nil context always panicked; only the
+   message is new. `Drain` on a `Subscription` no Group made panics again, as
+   in v0.4.0.
+2. Callers that were waiting on an open when its upstream ended, and any that
+   arrive before they have joined it, get a subscription already ended with
+   its error rather than each a fresh upstream, as the caller that opened it
+   always did. To try again, check `Err` or `Done` after subscribing and
+   subscribe again.
+3. `Group.Close` returns the errors of the stop funcs on every call, not only
+   the first. Code that reports the error of each of two Closes reports a
+   failed stop twice.
+4. `Drain` returns nil, not the error of `send`, when its context ended while
+   `send` was failing.
+
 ## v0.4.1 — 2026-09-27
 
 A hang in `Group.Close`, two silent misuses turned into loud ones, and what a

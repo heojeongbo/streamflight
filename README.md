@@ -313,7 +313,7 @@ gauge per key that outlives an upstream's end, count their calls instead.
 
 ## Performance
 
-`go test -run='^$' -bench=. -benchmem` on an Apple M4 Pro, Go 1.26.4.
+`go test -run='^$' -bench=. -benchmem` on an Apple M3 Max, Go 1.26.4.
 
 **Sharing.** One 4 KiB message per op, each decoded by copying and checksumming
 it. A dedicated upstream per subscriber decodes it once per subscriber; a
@@ -321,29 +321,30 @@ shared one decodes it once.
 
 | Subscribers | Dedicated | Shared | |
 |---:|---:|---:|---:|
-| 1 | 731 ns | 784 ns | 1× |
-| 10 | 7.2 µs | 0.77 µs | 9.4× |
-| 100 | 72 µs | 0.92 µs | 79× |
+| 1 | 859 ns | 854 ns | 1× |
+| 10 | 8.4 µs | 0.87 µs | 9.7× |
+| 100 | 83 µs | 1.04 µs | 79× |
 
 **Emit**, one value to every subscriber of a key. No allocation in any case.
 
 | Subscribers | `SubscribeFunc` | `Subscribe`, read by a goroutine | `Subscribe`, full (`DropOldest`) |
 |---:|---:|---:|---:|
-| 1 | 5.5 ns | 36 ns | 24 ns |
-| 10 | 23 ns | 484 ns | 213 ns |
-| 100 | 194 ns | 15.2 µs | 2.5 µs |
+| 1 | 6.4 ns | 49 ns | 28 ns |
+| 10 | 25 ns | 565 ns | 246 ns |
+| 100 | 197 ns | 13.2 µs | 2.4 µs |
 
 A channel costs most when its reader is parked: each send wakes a goroutine.
 Prefer `SubscribeFunc` for high fan-out on a hot path.
 
-**Sampling**, where the key keeps one value however many subscribers read it.
-`Latest()` itself is 5.1 ns and allocates nothing.
+**Sampling**, where the key keeps one value however many subscribers read it,
+so an `Emit` costs the same for one sampler as for a hundred. `Latest()` itself
+is 5.7 ns and allocates nothing.
 
 | Subscribers | `Subscribe`, read by a goroutine | `SubscribeLatest` | |
 |---:|---:|---:|---:|
-| 1 | 37 ns | 39 ns | 1× |
-| 10 | 463 ns | 47 ns | 10× |
-| 100 | 14.7 µs | 182 ns | 80× |
+| 1 | 49 ns | 42 ns | 1.2× |
+| 10 | 565 ns | 42 ns | 13× |
+| 100 | 13.2 µs | 42 ns | 310× |
 
 **Independence.** Opening keys that share nothing, with a `Source` that takes
 1 ms — roughly what subscribing to a broker costs. The total is one delay, not
@@ -351,17 +352,17 @@ one per key.
 
 | Keys opened at once | 1 | 8 | 32 |
 |---|---:|---:|---:|
-| Total | 1.19 ms | 1.28 ms | 1.24 ms |
+| Total | 1.17 ms | 1.20 ms | 1.24 ms |
 
 **Lifecycle.**
 
 | | Time | Allocations |
 |---|---:|---:|
-| Join and leave an open key, `SubscribeFunc` | 78 ns | 2 |
-| Join and leave an open key, `Subscribe` | 103 ns | 3 |
-| Join with `Replay: 8` to catch up on | 206 ns | 3 |
-| Open and stop a key | 198 ns | 5 |
-| Emit from 12 goroutines at once, 10 subscribers | 112 ns | 0 |
+| Join and leave an open key, `SubscribeFunc` | 88 ns | 2 |
+| Join and leave an open key, `Subscribe` | 119 ns | 3 |
+| Join with `Replay: 8` to catch up on | 227 ns | 3 |
+| Open and stop a key | 220 ns | 5 |
+| Emit from 14 goroutines at once, 10 subscribers | 145 ns | 0 |
 
 ## Development
 
