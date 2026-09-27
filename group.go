@@ -104,7 +104,9 @@ type Group[K comparable, T any] struct {
 	// Linger keeps an upstream running this long after its last subscriber
 	// leaves, so a subscriber that comes back in time, such as a reloaded page,
 	// reuses it instead of opening it again. Zero or less stops it at once. An
-	// upstream that has ended by itself does not linger.
+	// upstream that has ended by itself when its last subscriber leaves does
+	// not linger; one that ends while it lingers is stopped as [Emitter.End]
+	// says.
 	Linger time.Duration
 
 	// Hooks observe the Group, for logging and metrics.
@@ -350,8 +352,10 @@ func mustContext(ctx context.Context) {
 // Close waits for an upstream another goroutine is opening or stopping, and a
 // second Close waits for the first: once any Close returns, every upstream of
 // the Group has been stopped. The error of a stop func Close only waits for is
-// not Close's to return: the [Subscription.Close] that ran it returns it, and
-// the Stopped hook reports it wherever it ran.
+// not Close's to return. The Stopped hook reports it wherever it ran, and a
+// [Subscription.Close] that ran it returns it; one run by a Linger timer, by a
+// subscriber reopening an ended key or by a Context subscribe that gave up
+// reaches no caller.
 //
 // Groups that feed one another, where a Source of one subscribes to a key of
 // the other, must be closed together, each on its own goroutine. Closed one
@@ -524,9 +528,9 @@ func (g *Group[K, T]) acquire(ctx context.Context, done <-chan struct{}, key K, 
 		}
 		g.mu.Lock()
 		// Those who waited for an open share how it went: an error its Source
-		// returned, or an end it came to while opening, which they join rather
-		// than each opening the key again. Pending keeps it from being stopped
-		// or taken over before they have.
+		// returned, or an end it came to before they are back, which they join
+		// rather than each opening the key again. Pending keeps it from being
+		// stopped or taken over before they have.
 		shared := waited
 		if waited != nil {
 			// No longer pending on it: whatever happens next, joining it

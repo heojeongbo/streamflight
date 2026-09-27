@@ -3898,7 +3898,12 @@ func TestPanics(t *testing.T) {
 		b, err := g.Subscribe("b")
 		x.NoError(err)
 
-		x.PanicsWithValue(boom, func() { g.Close() })
+		var p any
+		returns(t, func() { // failing rather than hanging if the rest are not stopped
+			defer func() { p = recover() }()
+			g.Close()
+		})
+		x.Equal(boom, p)
 		x.ElementsMatch([]string{"open a", "open b", "stop a", "stop b"}, r.Log(),
 			"each stop panicked, and each still ran")
 		x.ErrorIs(a.Err(), streamflight.ErrGroupClosed)
@@ -3933,7 +3938,12 @@ func TestPanics(t *testing.T) {
 			subs = append(subs, s)
 		}
 
-		x.PanicsWithValue(boom, func() { g.Close() })
+		var p any
+		returns(t, func() { // failing rather than hanging if the rest are not stopped
+			defer func() { p = recover() }()
+			g.Close()
+		})
+		x.Equal(boom, p)
 		var err error
 		returns(t, func() { err = g.Close() })
 		x.ErrorIs(err, before, "stopped before the panic, and not lost to it")

@@ -228,9 +228,9 @@ subscriber leaves, so a reloaded page reuses it instead of opening it again.
 
 **Upstreams that end.** A Source calls `Emitter.End` when its upstream ends by
 itself. Every subscriber is closed with that error, and the next subscriber
-opens a fresh upstream. Those waiting on an open that the upstream ended
-during, and any who arrive before they have joined it, share that end rather
-than each opening it again.
+opens a fresh upstream. Those still waiting on its open when it ends, and any
+who arrive before they have joined it, share how the open went, that end
+included, rather than each opening it again.
 
 **One key.** A Group need not have many. One upstream shared by whoever wants
 it, such as a socket or a device, is a `Group[struct{}, T]` subscribed to with
@@ -246,8 +246,8 @@ gauge per key that outlives an upstream's end, count their calls instead.
 
 - **One upstream per key.** Concurrent subscribers of a key open it once, and it
   is stopped once. Those waiting on an open share how it went: an error its
-  `Source` returned, or an end the upstream came to as it opened, which anyone
-  arriving before they have joined it shares too.
+  `Source` returned, or an end the upstream came to before they have joined
+  it, which anyone arriving meanwhile shares too.
 - **Open and stop are serialized.** A key is never re-opened before its previous
   upstream has been stopped.
 - **In order, one at a time.** Values reach every subscriber in the order they

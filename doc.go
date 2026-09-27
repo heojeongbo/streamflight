@@ -16,9 +16,9 @@
 //
 // An upstream can also end by itself through [Emitter.End]. Every subscriber is
 // then closed with the error it ended with, and the next subscriber opens a
-// fresh upstream. Those waiting on an open that the upstream ended during, and
-// any who arrive before they have joined it, are not the next: they share that
-// end.
+// fresh upstream. Those still waiting on its open when it ends, and any who
+// arrive before they have joined it, are not the next: they share how the open
+// went, that end included.
 //
 // A Group need not have many keys. One upstream shared by whoever wants it,
 // opened by the first and stopped after the last, is a Group[struct{}, T]
@@ -74,8 +74,8 @@
 //
 //   - One upstream per key: concurrent subscribers of a key open it once, and it
 //     is stopped once. Those waiting on an open share how it went: an error
-//     its Source returned, or an end the upstream came to as it opened, which
-//     anyone arriving before they have joined it shares too.
+//     its Source returned, or an end the upstream came to before they have
+//     joined it, which anyone arriving meanwhile shares too.
 //   - Open and stop are serialized: a key is never re-opened before its previous
 //     upstream has been stopped.
 //   - Values reach every subscriber of a key in the order they were emitted, and
