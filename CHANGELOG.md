@@ -1,5 +1,82 @@
 # Changelog
 
+## v0.4.3 — 2026-09-28
+
+Keys a map cannot hold on to, which the compiler checking that `K` is
+`comparable` does not rule out: one wedged `Group.Close` forever and lost the
+sharing the package exists for, the other left the whole Group locked. And the
+last of an `Ended` hook that reported a key the Group had begun to stop.
+Nothing to rewrite, but two kinds of key that used to be accepted now panic;
+see *Upgrading*.
+
+### Fixed
+
+- **A key not equal to itself was stored under a key nothing could find
+  again.** A NaN, or any key holding one — a struct with a float field, an
+  array, a `Group[any, T]` given one — went into the map under a key no lookup
+  ever matched, so three things went wrong at once and none of them said so.
+  Every subscriber of that key opened an upstream of its own instead of joining
+  one, which is the whole of what the package promises. The `delete` that frees
+  a key removed nothing, so each upstream left its entry behind for the life of
+  the Group. And `Group.Close`, finding a flight it could neither claim nor be
+  woken by, waited forever, as did every `Close` after it: one subscribe whose
+  open merely *failed* under such a key was enough to make the Group
+  unclosable. Subscribing with one now panics where the key is passed.
+
+- **A key with no equality at all left the whole Group locked.** A slice, map
+  or func in a `Group[any, T]` panicked where the map hashed it, which is under
+  the lock the whole Group shares, and nothing ever let that lock go:
+  subscribing to any other key, closing a subscription already open, closing
+  the Group and the `Linger` timer all waited on it forever, no upstream could
+  be stopped, and `Emit` and `End`, which take only the key's own lock, went on
+  working, so the Group looked alive while its whole lifecycle was wedged. The
+  first `Subscribe` on a brand-new Group was enough, since Go checks the key
+  before the empty-map shortcut. Such a key is now compared before the Group
+  takes its lock, so the panic reaches the caller and leaves the Group as it
+  found it.
+
+- **`Hooks.Ended` could still report a key `Group.Close` had begun to stop.**
+  v0.4.2 decided that by the close of the flight's `quit`, which is the first
+  thing a stop does. But a stop begins before that, when it claims the key
+  under the Group's lock, and an `End` arriving between the claim and the close
+  was still counted as an end of the key's own. `Group.Close` claims every live
+  key in one critical section and only then releases them one by one, so the
+  window is as wide as the number of keys: an upstream that ended by itself
+  during a graceful shutdown, a dropped connection or a `Run` function
+  returning, could be reported as having died on its own. The claim now closes
+  `quit` itself, so the flight's own `sync.Once` is the single place that
+  decides. The regression test for v0.4.2 took the close of `quit` for the
+  first step of a stop, which is why it never covered this.
+
+  A delivery waiting on a `Block` subscriber of a key being stopped is now
+  released as the key is claimed rather than as its stop runs, which is a
+  little earlier on the `Close` path.
+
+### Documentation
+
+- What a key must be beyond `comparable`, on `Group` and among the rules in the
+  package documentation: equal to itself, and having equality at all.
+- The Group's lock is a leaf: a flight's `quitOnce` is the one lock taken under
+  it, and what runs under that closes a channel and takes no lock.
+
+### Upgrading
+
+`go get github.com/heojeongbo/streamflight@v0.4.3`. Nothing to rewrite. Worth
+a look:
+
+1. Two kinds of key now panic where they are subscribed, rather than be
+   accepted and then wedge the Group. One not equal to itself panics with
+   `streamflight: key NaN is not equal to itself, so its upstream could be
+   neither shared nor forgotten`; one whose dynamic type has no equality panics
+   with Go's own `comparing uncomparable type`, from the comparison that now
+   happens before the lock. A `Group[float64, T]` keyed by a computed ratio, or
+   a `Group[any, T]` keyed by whatever a request carried, is worth a check
+   where the key is made.
+2. `Hooks.Ended` no longer fires for a key `Group.Close` claimed first, even
+   when the `End` lands in the first instants of the stop. A counter that used
+   to see upstreams die by themselves during shutdown now sees only `Stopped`
+   for them.
+
 ## v0.4.2 — 2026-09-28
 
 A relay that returned its client's write error about half the times the client
