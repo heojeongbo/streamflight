@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"runtime"
 	"slices"
@@ -1538,6 +1539,95 @@ func TestMisuse(t *testing.T) {
 			escaped(1)
 		})
 		x.NoError(s.Close())
+	})
+	t.Run("a key not equal to itself is refused under every name", func(t *testing.T) {
+		x := require.New(t)
+		var opened atomic.Int64
+		g := &streamflight.Group[float64, int]{
+			Source: func(float64, streamflight.Emitter[int]) (func() error, error) {
+				opened.Add(1)
+				return nil, nil
+			},
+		}
+		nan := math.NaN()
+		const want = "streamflight: key NaN is not equal to itself," +
+			" so its upstream could be neither shared nor forgotten"
+		ctx := context.Background()
+
+		x.PanicsWithValue(want, func() { g.Subscribe(nan) })
+		x.PanicsWithValue(want, func() { g.SubscribeFunc(nan, func(int) {}) })
+		x.PanicsWithValue(want, func() { g.SubscribeLatest(nan) })
+		x.PanicsWithValue(want, func() { g.SubscribeContext(ctx, nan) })
+		x.PanicsWithValue(want, func() { g.SubscribeFuncContext(ctx, nan, func(int) {}) })
+		x.PanicsWithValue(want, func() { g.SubscribeLatestContext(ctx, nan) })
+		x.Zero(opened.Load(), "nothing was opened under a key nothing could find again")
+
+		// Nothing the key is buried in hides it, and nothing a map can hold is
+		// refused with it.
+		type point struct{ lat, lon float64 }
+		gp := &streamflight.Group[point, int]{Source: func(point, streamflight.Emitter[int]) (func() error, error) {
+			return nil, nil
+		}}
+		x.PanicsWithValue("streamflight: key {NaN 0} is not equal to itself,"+
+			" so its upstream could be neither shared nor forgotten", func() {
+			gp.Subscribe(point{lat: nan})
+		})
+		ga := &streamflight.Group[any, int]{Source: func(any, streamflight.Emitter[int]) (func() error, error) {
+			return nil, nil
+		}}
+		x.PanicsWithValue(want, func() { ga.Subscribe(any(nan)) })
+
+		// A refused key leaves the Group as it found it.
+		a, err := g.Subscribe(math.Inf(1))
+		x.NoError(err)
+		b, err := g.Subscribe(math.Copysign(0, -1))
+		x.NoError(err)
+		c, err := g.Subscribe(0)
+		x.NoError(err)
+		x.Equal(int64(2), opened.Load(), "-0.0 and +0.0 are one key, as they are to a map")
+		x.NoError(a.Close())
+		x.NoError(b.Close())
+		x.NoError(c.Close())
+		x.NoError(g.Close())
+	})
+	t.Run("a key with no equality is refused without locking the Group", func(t *testing.T) {
+		x := require.New(t)
+		r := newRecorder()
+		g := &streamflight.Group[any, int]{Source: func(key any, e streamflight.Emitter[int]) (func() error, error) {
+			return r.Source(key.(string), e)
+		}}
+
+		// Compared before the Group takes its lock, so the panic is the
+		// comparison's rather than the map's, and leaves nothing held.
+		x.PanicsWithError("runtime error: comparing uncomparable type []int", func() {
+			g.Subscribe([]int{1})
+		})
+		x.PanicsWithError("runtime error: comparing uncomparable type map[string]int", func() {
+			g.SubscribeLatest(map[string]int{})
+		})
+		x.Empty(r.Log(), "before anything was opened")
+
+		// Every other key still works, and the Group still closes: waiting for
+		// a lock nobody can let go would hang both.
+		done := make(chan error, 1)
+		go func() {
+			s, err := g.Subscribe("k")
+			if err != nil {
+				done <- err
+				return
+			}
+			if err := s.Close(); err != nil {
+				done <- err
+				return
+			}
+			done <- g.Close()
+		}()
+		select {
+		case err := <-done:
+			x.NoError(err)
+		case <-time.After(10 * time.Second):
+			x.Fail("the Group was left locked by the refused key")
+		}
 	})
 }
 

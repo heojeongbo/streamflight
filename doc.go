@@ -150,6 +150,10 @@
 //     is waiting to join it (after [Group.Linger], unless it has ended), when
 //     the Group is closed, or, once it has ended by itself, when the next
 //     subscriber of its key arrives to open a fresh one.
+//   - A key must be one a map can hold on to, which K being comparable does not
+//     settle: a key that is not equal to itself, a NaN or anything containing
+//     one, and a key with no equality at all, a slice in a Group[any, T], are
+//     refused where they are subscribed. See [Group].
 //   - A panic in the caller's code, whether a hook, [Group.Initial],
 //     [Group.Now], a SubscribeFunc function, a Source or a stop func, fails the
 //     call it ran in: the Group is not left locked, and nobody is left waiting

@@ -3,6 +3,7 @@ package streamflight
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -33,8 +34,10 @@ var (
 //
 //   - g.flights[k] is non-nil exactly while that flight is opening, live or
 //     stopping. Whoever makes it dead deletes it.
-//   - g.mu is a leaf: nothing is waited on while it is held, and the only user
-//     code that runs under it is the Joined and Left hooks.
+//   - g.mu is a leaf: the only user code that runs under it is the Joined and
+//     Left hooks, and the only lock taken under it is a flight's quitOnce,
+//     whose critical section closes a channel and takes no lock at all. Nothing
+//     else is waited on while it is held.
 //   - f.stop is called by exactly one goroutine, the one whose live to stopping
 //     claim succeeded.
 type state uint8
@@ -50,6 +53,14 @@ const (
 //
 // Set Source, and optionally the other fields, before first use and do not
 // change them afterwards. A Group must not be copied after first use.
+//
+// A key must be a key a map can hold on to, which the compiler checking that K
+// is comparable does not settle. Subscribing with a key that is not equal to
+// itself, a NaN or anything containing one, panics: stored, it would be found
+// by nothing, so every subscriber would open an upstream of its own and none
+// of them would ever be forgotten. So does subscribing with a key that has no
+// equality at all, a slice in a Group[any, T], which panics wherever it is
+// compared or hashed.
 type Group[K comparable, T any] struct {
 	// Source opens the upstream of a key. Required: subscribing to a Group
 	// without one panics.
@@ -343,6 +354,27 @@ func mustContext(ctx context.Context) {
 	}
 }
 
+// mustKey refuses a key the Group's map could not hold on to, before the Group
+// takes its lock.
+//
+// A key that is not equal to itself, a NaN or anything containing one, is
+// stored under a key no lookup ever matches: every subscriber would open an
+// upstream of its own rather than join one, the delete that frees the key would
+// leave it behind, and Close would then wait forever on an upstream nobody is
+// going to stop. Refused here rather than silently doing all three.
+//
+// A key whose dynamic type is not comparable, a slice in a Group[any, T], has
+// no equality either, and comparing it panics. That is the point of comparing
+// it here: hashing it panics too, and the map is only reached under the lock
+// the whole Group shares, which the panic would take with it and wedge every
+// other key. This panic leaves the Group as it found it.
+func mustKey[K comparable](key K) {
+	if key != key {
+		panic(fmt.Sprintf("streamflight: key %v is not equal to itself,"+
+			" so its upstream could be neither shared nor forgotten", key))
+	}
+}
+
 // Close stops every upstream, ends every subscription with ErrGroupClosed and
 // makes later Subscribe calls fail with it. It returns the errors of the stop
 // funcs it runs, joined. Close is idempotent and returns the same error every
@@ -416,18 +448,17 @@ func (g *Group[K, T]) closeAll(errs *[]error) {
 		g.mu.Unlock()
 
 		// In three steps, so that no key's stop waits on another's delivery.
-		// First release every delivery waiting on a Block subscriber of a key
-		// about to stop: a stop func that closes a subscription to another
-		// key, as a derived stream's does, waits for that key's delivery,
-		// which only that key's own stop would release otherwise. Then end
-		// every subscriber of them, so that a released Block subscriber is not
-		// left live and refused values for as long as other keys' deliveries
-		// and stops take; a delivery in progress on its own key still holds
-		// it until that returns. Only then run the stops, so none runs until
-		// each of these keys' deliveries in progress has returned.
-		for _, f := range doomed {
-			f.unblock()
-		}
+		// The first was taken by the claim above, which released the delivery
+		// waiting on a Block subscriber of each key as it claimed that key, so
+		// all of them are released before any of these keys is ended or
+		// stopped: a stop func that closes a subscription to another key, as a
+		// derived stream's does, waits for that key's delivery, which only that
+		// key's own stop would release otherwise. Then end every subscriber of
+		// them, so that a released Block subscriber is not left live and
+		// refused values for as long as other keys' deliveries and stops take;
+		// a delivery in progress on its own key still holds it until that
+		// returns. Only then run the stops, so none runs until each of these
+		// keys' deliveries in progress has returned.
 		endAll(doomed)
 		g.stopAll(doomed, errs)
 		if len(doomed) == 0 {
@@ -484,6 +515,7 @@ func (g *Group[K, T]) subscribe(ctx context.Context, key K, s *Subscription[T]) 
 	if g.Source == nil {
 		panic("streamflight: Group.Source is nil")
 	}
+	mustKey(key)
 	var done <-chan struct{}
 	if ctx != nil {
 		done = ctx.Done() // nil for a context that is never done
@@ -709,10 +741,23 @@ func (g *Group[K, T]) now() time.Time {
 	return time.Now()
 }
 
-// claimLocked moves f from live to stopping, disarming its linger timer.
-// g.mu must be held, and the caller must have seen f live under it.
+// claimLocked moves f from live to stopping, closing its quit and disarming
+// its linger timer. g.mu must be held, and the caller must have seen f live
+// under it. Every caller goes on to stop f.
 func (g *Group[K, T]) claimLocked(f *flight[K, T]) {
 	f.st = stopping
+	// Closed here, in the critical section that claims f, rather than left to
+	// doStop, so that quitOnce is the one place deciding whether f ended by
+	// itself: an End that reaches it first did end f before any stop had begun,
+	// and one that arrives after this finds quit closed and reports nothing,
+	// which is what Hooks.Ended promises for a flight the Group had begun to
+	// stop. Left to doStop, the close would come once g.mu was released, and an
+	// End in between would report a flight already being stopped as its own
+	// end. This is also what releases the delivery waiting on a Block
+	// subscriber of every key a Close claims, before it ends or stops any of
+	// them. quitOnce is the only lock taken under g.mu, and what runs under it
+	// closes a channel and takes no lock, so g.mu stays a leaf.
+	f.unblock()
 	if f.timer != nil {
 		f.timer.Stop()
 		f.timer = nil

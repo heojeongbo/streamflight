@@ -50,7 +50,8 @@ func TestHelpPassesOverACallerThatGaveUp(t *testing.T) {
 // the upstream ending by itself: Close begins every stop before it ends any
 // key, and a key fed by another can end in reply before its own end comes.
 // The window is narrow from outside, so the stop's first step is taken by
-// hand here.
+// hand here: the claim, which is what says a stop has begun, rather than the
+// close of quit that the claim makes.
 func TestEndOnceAStopHasBegunIsNotEnded(t *testing.T) {
 	x := require.New(t)
 	ended := 0
@@ -64,10 +65,14 @@ func TestEndOnceAStopHasBegunIsNotEnded(t *testing.T) {
 	x.NoError(err)
 	f := g.flights["k"]
 
-	f.unblock() // what every stop does first
+	g.mu.Lock()
+	x.True(g.beginStop(f)) // what every stop does first
+	g.mu.Unlock()
+
 	f.End(errors.New("in reply"))
 	x.Zero(ended)
 	x.EqualError(s.Err(), "in reply", "its subscribers are ended all the same")
+	x.NoError(g.doStop(f, nil))
 	x.NoError(s.Close())
 }
 
