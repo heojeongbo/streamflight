@@ -19,9 +19,13 @@ type flight[K comparable, T any] struct {
 	// a Block subscriber gives up before the ending needs mu.
 	quit     chan struct{}
 	quitOnce sync.Once
-	// byItself says that an End closed quit, before any stop had begun. Set
-	// within quitOnce, so read after it.
+	// byItself says that an End closed quit, before any stop had begun, and
+	// selfErr is what that End ended it with. Both are set within quitOnce, so
+	// whoever finishes the flight reads the end the once decided rather than
+	// deciding a second time: every caller of finish has been through the once,
+	// since a stop closes quit as it claims the flight.
 	byItself bool
+	selfErr  error
 
 	// Guarded by g.mu. pending counts the callers waiting for f to finish
 	// opening so as to join it: while any are, f is not stopped for having no
@@ -37,8 +41,11 @@ type flight[K comparable, T any] struct {
 	// is closed, and read only after receiving from it.
 	openErr error
 
-	// ended mirrors done so the Group can tell whether this flight has ended
-	// without waiting for a delivery that is holding mu. Written under mu.
+	// ended says this flight is over, for the Group to read without waiting for
+	// a delivery that is holding mu. Set within quitOnce by an End of the
+	// flight's own, and under mu by finish for every other ending, so that an
+	// End is over from the moment it is decided rather than from the moment it
+	// reaches mu.
 	ended atomic.Bool
 
 	// The newest value, for the subscribers that sample instead of being
@@ -146,7 +153,9 @@ func (f *flight[K, T]) Emit(v T) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if f.done {
+	// ended, not only done: an End decides the flight is over before it can take
+	// mu, and a value emitted in between is emitted after the upstream ended.
+	if f.done || f.ended.Load() {
 		return 0
 	}
 	if len(f.ring) > 0 {
@@ -232,20 +241,16 @@ func (f *flight[K, T]) End(err error) {
 	// Ended by itself only if nothing was stopping it yet: once a stop has
 	// begun, as Close's begins for every key it finds running before ending
 	// any, an upstream that ends in reply, such as one fed by a key Close
-	// ended first, is the Group stopping it. Of two Ends, the one that
-	// finishes the flight reports it, which need not be the one that closed
-	// quit.
-	f.quitOnce.Do(f.endByItself)
+	// ended first, is the Group stopping it. Of two Ends the first decides
+	// both, which is what makes an End after the first do nothing.
+	f.quitOnce.Do(func() { f.endByItself(err) })
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.done {
+		// finish reports it, rather than this call: a stop that took mu first
+		// has finished the flight already, and the end is still owed.
 		f.finish(err)
-		// Under mu, so that it is reported before Stopped: stopping takes mu
-		// to see whether the flight has already ended.
-		if f.byItself && f.g.Hooks.Ended != nil {
-			f.g.Hooks.Ended(f.key, err)
-		}
 	}
 }
 
@@ -258,9 +263,25 @@ func (f *flight[K, T]) endClosed() {
 	}
 }
 
-// endByItself closes quit for an End that came before any stop.
-func (f *flight[K, T]) endByItself() {
-	f.byItself = true
+// endStopped ends every subscriber of a flight that is being stopped, taking
+// mu and letting it go itself, so that an Ended hook that panics while
+// reporting an end the stop overtook fails the stop rather than leave the key
+// locked.
+func (f *flight[K, T]) endStopped(reason error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.done {
+		f.finish(reason)
+	}
+}
+
+// endByItself records an End that came before any stop and closes quit. Run
+// within quitOnce, which is what makes this the one place the flight's own end
+// is decided: whoever finishes it reports it with selfErr, and everything that
+// asks whether it is over reads ended.
+func (f *flight[K, T]) endByItself(err error) {
+	f.byItself, f.selfErr = true, err
+	f.ended.Store(true)
 	close(f.quit)
 }
 
@@ -289,13 +310,18 @@ func (f *flight[K, T]) wakeLocked() {
 }
 
 // finish ends every subscriber with err and drops what is kept for Replay.
-// f.mu must be held.
+// f.mu must be held, and the caller must have been through quitOnce, so that an
+// end of the flight's own has already been recorded.
 func (f *flight[K, T]) finish(err error) {
+	if f.byItself {
+		// It ended by itself before anything began to stop it, so that is why
+		// its subscribers are ending, whatever the caller came here to say. A
+		// stop that reaches mu first would otherwise close them with its own
+		// reason, a nil one for an ordinary stop, and lose the error.
+		err = f.selfErr
+	}
 	// Before anything else: the Group reads this without taking f.mu, which is
-	// what keeps a stalled delivery from stalling every other key. Do not
-	// derive it from quit instead: End closes quit before calling finish, so a
-	// quit-based check would let the Group end subscribers with a nil reason in
-	// between, rather than with err.
+	// what keeps a stalled delivery from stalling every other key.
 	f.ended.Store(true)
 	f.done = true
 	f.endErr = err
@@ -308,6 +334,14 @@ func (f *flight[K, T]) finish(err error) {
 	f.subs, f.samplers = nil, nil
 	f.ring = nil
 	f.count = 0
+
+	// Last, and here rather than in End: the End that decided this may still be
+	// waiting for mu while a stop finishes the flight, and the end is owed all
+	// the same. Under mu and before the stop func runs, so it is reported
+	// before Stopped and never beside a Dropped or Evicted of this key.
+	if f.byItself && f.g.Hooks.Ended != nil {
+		f.g.Hooks.Ended(f.key, err)
+	}
 }
 
 // attach adds s, first sending it what Replay and Initial have for it. It

@@ -163,28 +163,30 @@ func TestEvictionClearsWhatItMovesPast(t *testing.T) {
 	}
 }
 
-// Of two Ends, the one that finishes the flight reports it, even when the
-// other closed quit first: that other finds the flight ended and does
-// nothing, and Ended would otherwise not be reported at all.
+// Of two Ends the first decides, even when the second reaches the key's lock
+// first: the second finishes the flight, but with the first one's error and
+// reporting the first one's end, which is what makes an End after the first
+// one do nothing. Reported once, by whoever finishes.
 func TestEndsRacingAreEndedOnce(t *testing.T) {
 	x := require.New(t)
-	ended := 0
+	var ended []error
 	g := &Group[string, int]{
 		Source: func(string, Emitter[int]) (func() error, error) { return nil, nil },
 		Hooks: Hooks[string, int]{
-			Ended: func(string, error) { ended++ },
+			Ended: func(_ string, err error) { ended = append(ended, err) },
 		},
 	}
 	s, err := g.Subscribe("k")
 	x.NoError(err)
 	f := g.flights["k"]
 
-	f.quitOnce.Do(f.endByItself) // the first End, before it has mu
-	f.End(errors.New("second"))  // the second, which gets mu first
-	x.Equal(1, ended, "reported by the End that finished it")
-	f.End(errors.New("first")) // the first, resuming
-	x.Equal(1, ended)
-	x.EqualError(s.Err(), "second")
+	first := errors.New("first")
+	f.quitOnce.Do(func() { f.endByItself(first) }) // the first End, before it has mu
+	f.End(errors.New("second"))                    // the second, which gets mu first
+	x.Equal([]error{first}, ended, "the end the first one decided")
+	f.End(first) // the first, resuming
+	x.Len(ended, 1)
+	x.EqualError(s.Err(), "first")
 	x.NoError(s.Close())
 }
 
@@ -329,4 +331,108 @@ func TestEndPublishesWhyBeforeClosingTheQueue(t *testing.T) {
 
 	x.Panics(func() { s.end(io.EOF) })
 	x.ErrorIs(s.Err(), io.EOF)
+}
+
+// An End decides the flight is over where it closes quit, not where it reaches
+// the key's lock. A stop that takes the lock in between finishes the flight,
+// and the end is owed all the same: Ended is the only thing that carries why a
+// stream died, so losing it leaves a caller nothing to read. The window is a
+// few instructions from outside, so the End's first step is taken by hand.
+func TestEndOvertakenByAStopIsStillReported(t *testing.T) {
+	boom := errors.New("upstream gave up")
+
+	t.Run("by the last subscriber leaving", func(t *testing.T) {
+		x := require.New(t)
+		var ended []error
+		g := &Group[string, int]{
+			Source: func(string, Emitter[int]) (func() error, error) { return nil, nil },
+			Hooks:  Hooks[string, int]{Ended: func(_ string, err error) { ended = append(ended, err) }},
+		}
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		f := g.flights["k"]
+
+		f.quitOnce.Do(func() { f.endByItself(boom) }) // the End, before it has mu
+		x.NoError(s.Close())                          // stops it, reaching mu first
+
+		x.Equal([]error{boom}, ended)
+		f.End(boom) // the End, resuming: nothing left to do
+		x.Len(ended, 1)
+	})
+	t.Run("by Group.Close, which keeps the upstream's own error", func(t *testing.T) {
+		x := require.New(t)
+		var ended []error
+		g := &Group[string, int]{
+			Source: func(string, Emitter[int]) (func() error, error) { return nil, nil },
+			Hooks:  Hooks[string, int]{Ended: func(_ string, err error) { ended = append(ended, err) }},
+		}
+		s, err := g.Subscribe("k")
+		x.NoError(err)
+		f := g.flights["k"]
+
+		f.quitOnce.Do(func() { f.endByItself(boom) })
+		x.NoError(g.Close())
+
+		x.Equal([]error{boom}, ended)
+		x.ErrorIs(s.Err(), boom, "it had ended before the Close began, so that is why")
+		x.NoError(s.Close())
+	})
+}
+
+// An upstream that has ended by itself when its last subscriber leaves does not
+// linger: there is nothing left to come back to, and holding the stop func for
+// Linger holds whatever it closes with it.
+func TestAnEndedUpstreamDoesNotLinger(t *testing.T) {
+	x := require.New(t)
+	stops := 0
+	g := &Group[string, int]{
+		Linger: time.Hour,
+		Source: func(string, Emitter[int]) (func() error, error) {
+			return func() error { stops++; return nil }, nil
+		},
+	}
+	s, err := g.Subscribe("k")
+	x.NoError(err)
+	f := g.flights["k"]
+
+	f.quitOnce.Do(func() { f.endByItself(errors.New("gone")) }) // the End, before it has mu
+	x.NoError(s.Close())
+
+	g.mu.Lock()
+	armed, held := f.timer != nil, g.flights["k"] != nil
+	g.mu.Unlock()
+	x.False(armed, "an upstream that has ended has nothing to linger for")
+	x.False(held, "stopped, and the key given back")
+	x.Equal(1, stops)
+	x.NoError(g.Close())
+}
+
+// A value emitted after the upstream has ended is dropped, whether or not the
+// End that ended it has reached the key's lock yet.
+func TestAValueEmittedAfterTheEndIsDropped(t *testing.T) {
+	x := require.New(t)
+	g := &Group[string, int]{
+		Replay: 4,
+		Source: func(string, Emitter[int]) (func() error, error) { return nil, nil },
+	}
+	s, err := g.Subscribe("k", WithBuffer(4))
+	x.NoError(err)
+	f := g.flights["k"]
+
+	x.Equal(1, f.Emit(1), "before the end it is delivered")
+	f.quitOnce.Do(func() { f.endByItself(io.EOF) }) // the End, before it has mu
+	x.Zero(f.Emit(2), "the upstream has ended")
+	x.Equal(1, f.count, "and it was not kept for Replay either")
+
+	f.End(io.EOF)
+	x.Equal([]int{1}, drainInts(s.C))
+	x.NoError(s.Close())
+}
+
+func drainInts(c <-chan int) []int {
+	var out []int
+	for v := range c {
+		out = append(out, v)
+	}
+	return out
 }

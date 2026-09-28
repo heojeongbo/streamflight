@@ -17,7 +17,9 @@ var (
 	ErrEvicted = errors.New("streamflight: subscriber evicted for falling behind")
 
 	// ErrGroupClosed is returned by Subscribe on a closed Group, and is why its
-	// subscriptions ended when it was closed.
+	// subscriptions ended when it was closed. Not for an upstream that had
+	// already ended by itself: its subscribers are closed with the error it
+	// ended with, which is why it ended, and Close is only what stopped it.
 	ErrGroupClosed = errors.New("streamflight: group closed")
 
 	// ErrPollInterval is why opening a key failed when [Poll] was given an
@@ -205,7 +207,9 @@ type Hooks[K comparable, T any] struct {
 	// [Emitter.End], with the error its subscribers are closed with: io.EOF
 	// for End(nil). It is called before Stopped reports the same upstream, and
 	// not at all for one the Group had begun to stop, even if an End that came
-	// after is what closed its subscribers. An upstream that ends while its
+	// after is what closed its subscribers. An End decides that where it ends
+	// the upstream, so a stop that closes its subscribers first reports it
+	// rather than swallow it, and reports it with the End's error. An upstream that ends while its
 	// Source is still running, as one whose [Run] or [Poll] function fails at
 	// once can, is reported by Ended before Opened, and if the Source then
 	// fails, never by Stopped: there was nothing to stop, and nobody
@@ -860,11 +864,7 @@ func (g *Group[K, T]) doStop(f *flight[K, T], reason error) error {
 	}()
 
 	f.unblock()
-	f.mu.Lock()
-	if !f.done {
-		f.finish(reason)
-	}
-	f.mu.Unlock()
+	f.endStopped(reason)
 
 	// Outside f.mu: stop may wait for an Emit that is waiting for f.mu.
 	var err error
