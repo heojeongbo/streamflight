@@ -1,5 +1,69 @@
 # Changelog
 
+## v0.4.4 — 2026-09-28
+
+One root, three symptoms. An `End` marked its flight over in two steps — the
+close of `quit`, then the rest under the key's lock — and everything asking
+whether the upstream had ended read the second step, which a stop could get to
+first. The end is decided in one place now. Nothing to rewrite.
+
+### Fixed
+
+- **`Hooks.Ended` was lost to a stop that came after the end.** `End` reported
+  it only if it was still the one to finish the flight, so a last subscriber
+  leaving, a `Linger` timer or a `Group.Close` that took the key's lock in the
+  window between the two steps finished the flight first and `End` then found
+  nothing to do. The error went with it: `Ended` is the only thing that carries
+  why an upstream died, so a caller was left unable to tell a stream that
+  failed from one that was shut down. It is reported by whoever finishes the
+  flight now, still under the key's lock and still before `Stopped`.
+
+- **A stop could close subscribers with its own reason rather than the error
+  the upstream ended with**, in that same window: `nil` for an ordinary stop,
+  `ErrGroupClosed` for a `Close`. An upstream that ended by itself closes its
+  subscribers with its own error whatever finishes it, which is also what
+  `Ended` reports, as the hook has always promised.
+
+- **An upstream that had ended by itself still lingered.** The last subscriber
+  leaving in that window armed a `time.AfterFunc` for the whole of
+  `Group.Linger`, against a documented promise that it would not, and held
+  the stop func — a socket, a context, a goroutine to join — for that long
+  after there was nothing left to come back to. One that ends *while* it
+  lingers is unchanged: it is stopped when the timer runs out, as
+  `Emitter.End` says.
+
+- **A value emitted after the upstream ended was delivered.** `Emit` dropped on
+  the second step, so a value emitted in the window reached subscribers and
+  entered the `Replay` ring, against the guarantee that values emitted after an
+  upstream has ended are dropped. `Emit` and `End` after the first `End` now do
+  nothing, as `Emitter.End` says. Of two `End`s the first decides: the second
+  no longer replaces its error.
+
+### Documentation
+
+- `Hooks.Ended` says an `End` decides where it ends the upstream, so a stop
+  that closes the subscribers first reports it rather than swallow it.
+- `ErrGroupClosed` says it is not why an upstream that had already ended by
+  itself closed its subscribers.
+
+### Upgrading
+
+`go get github.com/heojeongbo/streamflight@v0.4.4`. Nothing to rewrite. Worth
+a look:
+
+1. `Hooks.Ended` fires in races where it used to be silent, so a counter of
+   upstreams that died by themselves will report ends it was missing. It is
+   still never called for an upstream the Group had begun to stop.
+2. Subscribers of an upstream that ended by itself now see that upstream's
+   error even when a `Group.Close` is what closed them, where they used to see
+   `ErrGroupClosed`. Code that treats `ErrGroupClosed` as "shutting down, do
+   not reconnect" should treat the upstream's own error the same way when it
+   arrives during a shutdown, which `Subscription.Err` has always been able to
+   return.
+3. Of two concurrent `End`s the first one's error is the one reported and the
+   one subscribers are closed with; it used to be whichever reached the key's
+   lock first.
+
 ## v0.4.3 — 2026-09-28
 
 Keys a map cannot hold on to, which the compiler checking that `K` is
