@@ -157,7 +157,10 @@ type Group[K comparable, T any] struct {
 // A hook that panics fails the call that reported it: the Group is not left
 // locked and nobody is left waiting on a key, but a key whose Opened, Joined
 // or Left panicked may go on running until its next subscriber leaves it (and
-// then its Linger runs out) or the Group is closed. A Stopped hook called when
+// then its Linger runs out) or the Group is closed. An Ended that panics is
+// the exception that proves it: whatever stops the upstream reports the end,
+// and the upstream is stopped and its key given back all the same, since after
+// that nothing could reach what its Source opened. A Stopped hook called when
 // a key's Linger runs out, and an Ended hook called as a [Run] or [Poll]
 // function returns, run where there is no call of the caller's to fail, and a
 // panic crashes the program. A Dropped, Evicted or Ended hook reached from an
@@ -209,7 +212,10 @@ type Hooks[K comparable, T any] struct {
 	// not at all for one the Group had begun to stop, even if an End that came
 	// after is what closed its subscribers. An End decides that where it ends
 	// the upstream, so a stop that closes its subscribers first reports it
-	// rather than swallow it, and reports it with the End's error. An upstream that ends while its
+	// rather than swallow it, and reports it with the End's error. Which is
+	// to say it is reported by the End itself, or, once something else has
+	// finished the upstream, by whatever stops it: a [Subscription.Close], a
+	// [Group.Close] or a Linger timer. An upstream that ends while its
 	// Source is still running, as one whose [Run] or [Poll] function fails at
 	// once can, is reported by Ended before Opened, and if the Source then
 	// fails, never by Stopped: there was nothing to stop, and nobody
@@ -864,9 +870,26 @@ func (g *Group[K, T]) doStop(f *flight[K, T], reason error) error {
 	}()
 
 	f.unblock()
-	f.endStopped(reason)
 
-	// Outside f.mu: stop may wait for an Emit that is waiting for f.mu.
+	// Ending it runs the Ended hook, which is the caller's code and may panic.
+	// What the Source opened is still open, and this call is the only one that
+	// will ever stop it: the key is given back below, where nobody else can
+	// reach it again, so the stop runs whatever the ending did and the panic
+	// goes on to fail this call once it has.
+	stopped := false
+	defer func() {
+		if !stopped {
+			_ = g.runStop(f)
+		}
+	}()
+	f.endStopped(reason)
+	stopped = true
+	return g.runStop(f)
+}
+
+// runStop runs f's stop func and reports it. It holds no lock, so the stop may
+// wait for an Emit that is waiting for f.mu.
+func (g *Group[K, T]) runStop(f *flight[K, T]) error {
 	var err error
 	if f.stop != nil {
 		err = f.stop()

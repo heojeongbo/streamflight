@@ -27,6 +27,13 @@ type flight[K comparable, T any] struct {
 	byItself bool
 	selfErr  error
 
+	// endedOwed says Hooks.Ended has still to be called for a flight that ended
+	// by itself. Set as it is finished and cleared as it is reported, both under
+	// mu, so that whoever finishes it need not be the one to run a hook that can
+	// panic: ending a key of a closing Group happens on a goroutine with no call
+	// to fail, and its stop, which follows, has one.
+	endedOwed bool
+
 	// Guarded by g.mu. pending counts the callers waiting for f to finish
 	// opening so as to join it: while any are, f is not stopped for having no
 	// subscriber, since one is about to arrive.
@@ -248,14 +255,17 @@ func (f *flight[K, T]) End(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.done {
-		// finish reports it, rather than this call: a stop that took mu first
-		// has finished the flight already, and the end is still owed.
 		f.finish(err)
 	}
+	// Whether or not this call finished it: a stop that took mu first has
+	// finished the flight already, and the end it decided is still owed.
+	f.reportEndedLocked()
 }
 
 // endClosed ends every subscriber of a flight its Group's Close has claimed,
-// and lets go of mu, which the caller must hold.
+// and lets go of mu, which the caller must hold. It leaves an end of the
+// flight's own for the stop that follows to report, so that no hook of the
+// caller's runs here: this is reached on a goroutine with no call to fail.
 func (f *flight[K, T]) endClosed() {
 	defer f.mu.Unlock()
 	if !f.done {
@@ -273,6 +283,10 @@ func (f *flight[K, T]) endStopped(reason error) {
 	if !f.done {
 		f.finish(reason)
 	}
+	// Here rather than where a closing Group ends its keys: that runs on a
+	// goroutine of the package's own, where a hook that panics would crash the
+	// program, and every key it ends is stopped through here straight after.
+	f.reportEndedLocked()
 }
 
 // endByItself records an End that came before any stop and closes quit. Run
@@ -335,13 +349,23 @@ func (f *flight[K, T]) finish(err error) {
 	f.ring = nil
 	f.count = 0
 
-	// Last, and here rather than in End: the End that decided this may still be
-	// waiting for mu while a stop finishes the flight, and the end is owed all
-	// the same. Under mu and before the stop func runs, so it is reported
-	// before Stopped and never beside a Dropped or Evicted of this key.
-	if f.byItself && f.g.Hooks.Ended != nil {
-		f.g.Hooks.Ended(f.key, err)
+	// Owed rather than reported here: the End that decided this may still be
+	// waiting for mu while a stop finishes the flight, so the end outlives the
+	// call that knew about it. Whoever reports it does so under mu and before
+	// the stop func runs, which is what keeps it before Stopped and never
+	// beside a Dropped or Evicted of this key.
+	f.endedOwed = f.byItself && f.g.Hooks.Ended != nil
+}
+
+// reportEndedLocked calls Hooks.Ended if this flight ended by itself and nobody
+// has reported it yet. Cleared before the call, so a hook that panics fails the
+// call it ran in and is not tried again. f.mu must be held.
+func (f *flight[K, T]) reportEndedLocked() {
+	if !f.endedOwed {
+		return
 	}
+	f.endedOwed = false
+	f.g.Hooks.Ended(f.key, f.endErr)
 }
 
 // attach adds s, first sending it what Replay and Initial have for it. It

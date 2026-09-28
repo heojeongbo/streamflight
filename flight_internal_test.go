@@ -436,3 +436,77 @@ func drainInts(c <-chan int) []int {
 	}
 	return out
 }
+
+// The Ended hook is the caller's code, so it can panic, and a stop is where it
+// is reported for every ending but an End's own. That must not cost the
+// upstream its stop: the key is given back as the stop returns, so after that
+// nothing can ever reach what the Source opened again.
+func TestEndedHookThatPanicsStillStops(t *testing.T) {
+	x := require.New(t)
+	stops, stopped := 0, 0
+	g := &Group[string, int]{
+		Source: func(string, Emitter[int]) (func() error, error) {
+			return func() error { stops++; return nil }, nil
+		},
+		Hooks: Hooks[string, int]{
+			Ended:   func(string, error) { panic("ended hook") },
+			Stopped: func(string, error) { stopped++ },
+		},
+	}
+	s, err := g.Subscribe("k")
+	x.NoError(err)
+	f := g.flights["k"]
+
+	f.quitOnce.Do(func() { f.endByItself(errors.New("gone")) }) // the End, before it has mu
+	x.PanicsWithValue("ended hook", func() { _ = s.Close() })   // the stop it is reported in
+
+	x.Equal(1, stops, "the upstream was stopped all the same")
+	x.Equal(1, stopped, "and reported")
+	x.Empty(g.flights, "and the key given back")
+	x.NoError(g.Close())
+}
+
+// Nor may it strand a closing Group. Close ends every key it claims before it
+// stops any, some on goroutines of its own where a panic would have no call to
+// fail, so the end is left for the stop that follows to report, on Close's own
+// goroutine. Every key it claimed is stopped, and the panic fails that Close.
+func TestEndedHookThatPanicsFailsCloseWithEverythingStopped(t *testing.T) {
+	x := require.New(t)
+	stops := 0
+	g := &Group[string, int]{
+		Source: func(string, Emitter[int]) (func() error, error) {
+			return func() error { stops++; return nil }, nil
+		},
+		Hooks: Hooks[string, int]{Ended: func(string, error) { panic("ended hook") }},
+	}
+	held, err := g.Subscribe("held") // ended on a goroutine of Close's own
+	x.NoError(err)
+	free, err := g.Subscribe("free") // ended on Close's goroutine
+	x.NoError(err)
+
+	for _, key := range []string{"held", "free"} {
+		f := g.flights[key]
+		f.quitOnce.Do(func() { f.endByItself(errors.New("gone")) })
+	}
+	g.flights["held"].mu.Lock() // Close cannot have it at once
+
+	done := make(chan any, 1)
+	go func() {
+		defer func() { done <- recover() }()
+		_ = g.Close()
+	}()
+	time.Sleep(10 * time.Millisecond) // Close is waiting for the held key
+	g.flights["held"].mu.Unlock()
+
+	select {
+	case r := <-done:
+		x.Equal("ended hook", r, "the panic fails the Close it ran in")
+	case <-time.After(5 * time.Second):
+		x.Fail("Close never returned")
+	}
+	x.Equal(2, stops, "both upstreams were stopped")
+	x.Empty(g.flights, "and both keys given back")
+	x.NoError(g.Close(), "a later Close has nothing left to do")
+	x.NoError(held.Close())
+	x.NoError(free.Close())
+}
