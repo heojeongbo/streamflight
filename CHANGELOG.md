@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.4.6 — 2026-09-28
+
+Additional regression tests and clearer panic-handling documentation for the
+shutdown fixes in v0.4.5. No runtime behavior or API changes.
+
+### Tests
+
+- Force the shutdown worker path without timing assumptions, and verify that
+  user hooks run on the stopping caller after subscribers have ended.
+- Verify that an End resuming during shutdown reports its hook exactly once,
+  preserves the original upstream error, and reports before Stopped.
+- Verify that a second panic in stop or Stopped does not retry cleanup or
+  retain the key after an Ended hook panics.
+
+### Documentation
+
+- Clarify that cleanup is guaranteed when Ended panics during a stop; an End
+  called directly retains the existing upstream lifecycle.
+- Document Ended panics during Group.Close and on Linger timers.
+
+### Upgrading
+
+`go get github.com/heojeongbo/streamflight@v0.4.6`.
+
 ## v0.4.5 — 2026-09-28
 
 Two ways an `Ended` hook that panics could cost more than its own call, both
@@ -30,10 +54,10 @@ affected, and there is nothing to rewrite.
 
 ### Documentation
 
-- `Hooks` says an `Ended` that panics still leaves its upstream stopped and its
-  key given back, and `Hooks.Ended` says which calls report it: the `End`
-  itself, or whatever stops the upstream once something else has finished it —
-  a `Subscription.Close`, a `Group.Close` or a `Linger` timer.
+- `Hooks` says an `Ended` that panics during a stop still leaves its upstream
+  stopped and its key given back, and `Hooks.Ended` says which calls report it:
+  the `End` itself, or whatever stops the upstream once something else has
+  finished it — a `Subscription.Close`, a `Group.Close` or a `Linger` timer.
 
 ### Upgrading
 

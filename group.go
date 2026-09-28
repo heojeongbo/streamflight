@@ -157,11 +157,10 @@ type Group[K comparable, T any] struct {
 // A hook that panics fails the call that reported it: the Group is not left
 // locked and nobody is left waiting on a key, but a key whose Opened, Joined
 // or Left panicked may go on running until its next subscriber leaves it (and
-// then its Linger runs out) or the Group is closed. An Ended that panics is
-// the exception that proves it: whatever stops the upstream reports the end,
-// and the upstream is stopped and its key given back all the same, since after
-// that nothing could reach what its Source opened. A Stopped hook called when
-// a key's Linger runs out, and an Ended hook called as a [Run] or [Poll]
+// then its Linger runs out) or the Group is closed. If Ended panics while a
+// stop reports it, the stop func still runs and the key is released before the
+// panic leaves that call. Ended or Stopped called when a key's Linger runs
+// out, and an Ended hook called as a [Run] or [Poll]
 // function returns, run where there is no call of the caller's to fail, and a
 // panic crashes the program. A Dropped, Evicted or Ended hook reached from an
 // Emit or End the caller makes fails that call; on the goroutine of a Run or
@@ -388,8 +387,8 @@ func mustKey[K comparable](key K) {
 // Close stops every upstream, ends every subscription with ErrGroupClosed and
 // makes later Subscribe calls fail with it. It returns the errors of the stop
 // funcs it runs, joined. Close is idempotent and returns the same error every
-// time. If a stop func or Stopped hook panics, that Close panics too, and every
-// later one returns the errors of the rest.
+// time. If an Ended hook, stop func or Stopped hook panics, that Close panics
+// too, and every later one returns the errors of the rest.
 //
 // Close waits for an upstream another goroutine is opening or stopping, and a
 // second Close waits for the first: once any Close returns, every upstream of
