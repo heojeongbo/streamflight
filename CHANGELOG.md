@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.4.5 — 2026-09-28
+
+Two ways an `Ended` hook that panics could cost more than its own call, both
+introduced in v0.4.4, which is the release that gave that hook somewhere new to
+be called from. Upgrade past v0.4.4 if you set `Hooks.Ended`; nothing else is
+affected, and there is nothing to rewrite.
+
+### Fixed
+
+- **An upstream could be dropped without being stopped.** The end is reported
+  where the upstream is stopped, and the stop func ran after it, so an `Ended`
+  hook that panicked took the stop with it — while the deferred clean-up gave
+  the key back and let go of the stop func regardless. What the `Source` had
+  opened, a socket or a goroutine, was then unreachable: not the next
+  subscriber's to stop, since the key was free, and not `Group.Close`'s, since
+  it was gone from the Group. The stop runs whatever the ending did now, and
+  the panic goes on to fail the call once it has.
+
+- **`Group.Close` could wait forever, or the program could die.** Close ends
+  every key it has claimed before it stops any, so the `Ended` hook ran there
+  too. A panic on that path skipped the stops, and the retry that follows a
+  failed pass then waited on keys it had claimed itself and left unstopped,
+  which nothing else will ever stop. Close ends the keys whose lock it cannot
+  take at once on goroutines of its own, where a panic had no call to fail and
+  crashed the program. No hook runs there now: ending a key leaves the end for
+  the stop that follows, which runs on Close's own goroutine, so a panic fails
+  that `Close` with every key stopped, as a panicking stop func already did.
+
+### Documentation
+
+- `Hooks` says an `Ended` that panics still leaves its upstream stopped and its
+  key given back, and `Hooks.Ended` says which calls report it: the `End`
+  itself, or whatever stops the upstream once something else has finished it —
+  a `Subscription.Close`, a `Group.Close` or a `Linger` timer.
+
+### Upgrading
+
+`go get github.com/heojeongbo/streamflight@v0.4.5`. Nothing to rewrite. An
+`Ended` hook may now be reported from a stop where v0.4.3 and earlier only ever
+reported it from `Emitter.End`; that is v0.4.4's change, not this one, and it is
+what lets an end survive the stop that overtook it.
+
 ## v0.4.4 — 2026-09-28
 
 One root, three symptoms. An `End` marked its flight over in two steps — the
