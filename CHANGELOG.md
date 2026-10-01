@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.4.7 — 2026-10-01
+
+A sampler joining a key paid for every value in that key's `Replay` ring, under
+the lock every other subscriber of the key waits for. Nothing to rewrite, and
+no behaviour or API change: `Replay` already gave a sampler nothing, only
+slowly.
+
+### Performance
+
+- **A sampler joins a key without walking its `Replay` ring.** A sampler reads
+  the newest value the key keeps rather than being caught up on what it
+  missed, and `Replay` keeps no arrival times, so it could never seed one:
+  every value in the ring was handed to a delivery that accepted it and stored
+  nothing. The ring is now skipped for a sampler. `Group.Initial` still runs
+  for one, as it always has, and a sampler still reads nothing from it.
+
+  | `Replay` | before | after |
+  |---:|---:|---:|
+  | 8 | 87 ns | 78 ns |
+  | 4096 | 5.3 µs | 78 ns |
+  | 65536 | 84 µs | 78 ns |
+
+  The cost of joining no longer depends on the ring at all, which is why the
+  three measurements after it are one number. Measured on an Apple M4 Pro,
+  Go 1.26.4, rather than the Apple M3 Max the README's tables are measured on.
+
+### Tests
+
+- `Group.Initial` is counted, so that skipping `Replay` for a sampler cannot
+  quietly take `Initial` with it.
+- `BenchmarkJoinReplay` measures joining a key with a full ring as a sampler
+  and as a channel subscriber, the second being what the first is flat
+  against.
+
+### Documentation
+
+- `LIFECYCLE.md`, a maintenance guide to the key ownership, the end reporting,
+  the lock rules and the shutdown and panic cleanup of `group.go`, `flight.go`
+  and `subscription.go`. The public contracts stay in the Go documentation;
+  this is the internal map those three files point at.
+
+### Upgrading
+
+`go get github.com/heojeongbo/streamflight@v0.4.7`. Nothing to rewrite.
+
 ## v0.4.6 — 2026-09-28
 
 Additional regression tests and clearer panic-handling documentation for the
