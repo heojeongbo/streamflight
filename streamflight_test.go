@@ -633,10 +633,11 @@ func TestSubscribeLatest(t *testing.T) {
 	t.Run("Replay and Initial give a sampler nothing, and each value is counted for it", func(t *testing.T) {
 		x := require.New(t)
 		r := newRecorder()
+		initialCalls := 0
 		g := &streamflight.Group[string, int]{
 			Source:  r.Source,
 			Replay:  2,
-			Initial: func(_ string, send func(int)) { send(9) },
+			Initial: func(_ string, send func(int)) { initialCalls++; send(9) },
 		}
 
 		var keep collector
@@ -646,6 +647,7 @@ func TestSubscribeLatest(t *testing.T) {
 
 		s, err := g.SubscribeLatest("k")
 		x.NoError(err)
+		x.Equal(2, initialCalls, "Initial still runs for the sampler")
 		_, _, ok := s.Latest()
 		x.False(ok, "a key someone else opened has nothing to sample until its next value")
 

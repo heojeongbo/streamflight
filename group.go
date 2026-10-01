@@ -42,6 +42,8 @@ var (
 //     else is waited on while it is held.
 //   - f.stop is called by exactly one goroutine, the one whose live to stopping
 //     claim succeeded.
+//
+// See LIFECYCLE.md for the transitions, the end reporting and the lock rules.
 type state uint8
 
 const (
@@ -875,14 +877,14 @@ func (g *Group[K, T]) doStop(f *flight[K, T], reason error) error {
 	// will ever stop it: the key is given back below, where nobody else can
 	// reach it again, so the stop runs whatever the ending did and the panic
 	// goes on to fail this call once it has.
-	stopped := false
+	stopStarted := false
 	defer func() {
-		if !stopped {
+		if !stopStarted {
 			_ = g.runStop(f)
 		}
 	}()
 	f.endStopped(reason)
-	stopped = true
+	stopStarted = true
 	return g.runStop(f)
 }
 

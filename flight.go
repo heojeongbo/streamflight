@@ -9,7 +9,7 @@ import (
 )
 
 // flight is the upstream of one key: its Source's Emitter and the set of
-// subscribers it delivers to.
+// subscribers it delivers to. See LIFECYCLE.md for the state and lock rules.
 type flight[K comparable, T any] struct {
 	g    *Group[K, T]
 	key  K
@@ -368,9 +368,10 @@ func (f *flight[K, T]) reportEndedLocked() {
 	f.g.Hooks.Ended(f.key, f.endErr)
 }
 
-// attach adds s, first sending it what Replay and Initial have for it. It
-// reports false, having done nothing, if done is closed before it has the
-// key's lock.
+// attach adds s, first sending it what Replay and Initial have for it. A
+// sampler keeps neither: the ring is skipped for it, and Initial is still
+// called but what it sends is discarded. It reports false, having done
+// nothing, if done is closed before it has the key's lock.
 func (f *flight[K, T]) attach(done <-chan struct{}, s *Subscription[T]) bool {
 	if !f.lock(done) {
 		return false
@@ -398,8 +399,12 @@ func (f *flight[K, T]) attach(done <-chan struct{}, s *Subscription[T]) bool {
 		policy = Evict
 	}
 	cut := false
-	for i := 0; i < f.count && !cut; i++ {
-		cut = f.push(s, f.ring[(f.head-f.count+i+len(f.ring))%len(f.ring)], policy) == evicted
+	// Samplers read the key's latest value, so walking Replay would only
+	// discard every value under the key's lock. Initial still runs below.
+	if s.kind != sampled {
+		for i := 0; i < f.count && !cut; i++ {
+			cut = f.push(s, f.ring[(f.head-f.count+i+len(f.ring))%len(f.ring)], policy) == evicted
+		}
 	}
 	if f.g.Initial != nil && !cut {
 		cut = f.initial(s, policy)
@@ -565,8 +570,9 @@ func (f *flight[K, T]) push(s *Subscription[T], v T, policy Overflow) outcome {
 		s.fn(v)
 		return accepted
 	case sampled:
-		// What Replay and Initial send as a sampler joins: the key keeps its
-		// newest value from what is emitted, not from what is caught up on.
+		// What Initial sends as a sampler joins: the key keeps its newest
+		// value from what is emitted, not from what is caught up on. Replay
+		// never arrives here: attach skips the ring for a sampler.
 		return accepted
 	}
 

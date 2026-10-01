@@ -385,3 +385,41 @@ func evictN(b *testing.B, n, every int) {
 		b.StartTimer()
 	}
 }
+
+// BenchmarkJoinReplay is what joining a key with a full Replay ring costs. A
+// sampler reads the key's latest value instead of catching up, so its line
+// stays flat while the channel subscriber's grows with the ring.
+func BenchmarkJoinReplay(b *testing.B) {
+	join := func(b *testing.B, replay int, sub func(*streamflight.Group[string, int]) *streamflight.Subscription[int]) {
+		b.Helper()
+		var e streamflight.Emitter[int]
+		g := &streamflight.Group[string, int]{
+			Replay: replay,
+			Source: func(_ string, e_ streamflight.Emitter[int]) (func() error, error) {
+				e = e_
+				return nil, nil
+			},
+		}
+		keep := sub(g)
+		defer keep.Close()
+		for i := range replay {
+			e.Emit(i) // fill the ring a joiner would be caught up on
+		}
+		b.ReportAllocs()
+		for b.Loop() {
+			sub(g).Close()
+		}
+	}
+	for _, replay := range []int{0, 8, 4096, 65536} {
+		b.Run(fmt.Sprintf("latest/replay=%d", replay), func(b *testing.B) {
+			join(b, replay, func(g *streamflight.Group[string, int]) *streamflight.Subscription[int] {
+				return must(g.SubscribeLatest("k"))
+			})
+		})
+		b.Run(fmt.Sprintf("chan/replay=%d", replay), func(b *testing.B) {
+			join(b, replay, func(g *streamflight.Group[string, int]) *streamflight.Subscription[int] {
+				return must(g.Subscribe("k", streamflight.WithBuffer(8)))
+			})
+		})
+	}
+}

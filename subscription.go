@@ -320,7 +320,8 @@ func (s *Subscription[T]) Close() error {
 	return s.closeErr
 }
 
-// end finishes the subscription. Called once, under the key's lock.
+// end finishes the subscription. Called once, under the key's lock; see
+// LIFECYCLE.md for who ends a subscriber and when.
 func (s *Subscription[T]) end(err error) {
 	s.err = err
 	// Before the queue. A reader that ranges over C asks Err why it ended as

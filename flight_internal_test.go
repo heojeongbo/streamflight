@@ -467,9 +467,13 @@ func TestEndedHookThatPanicsStillStops(t *testing.T) {
 }
 
 // Nor may it strand a closing Group. Close ends every key it claims before it
-// stops any, some on goroutines of its own where a panic would have no call to
-// fail, so the end is left for the stop that follows to report, on Close's own
-// goroutine. Every key it claimed is stopped, and the panic fails that Close.
+// stops any, and endClosed reports no hook on any of those paths, since some
+// of those keys are ended on goroutines of Close's own where a panic would
+// have no call to fail: the end is always left for the stop that follows, on
+// Close's own goroutine. Every key it claimed is stopped, and the panic fails
+// that Close. Nothing holds either key's lock here, so both are ended inline;
+// the worker path is forced in TestEndAllLeavesHooksForTheStoppingCaller,
+// which calls endAll with an order of its own.
 func TestEndedHookThatPanicsFailsCloseWithEverythingStopped(t *testing.T) {
 	x := require.New(t)
 	stops := 0
@@ -479,34 +483,31 @@ func TestEndedHookThatPanicsFailsCloseWithEverythingStopped(t *testing.T) {
 		},
 		Hooks: Hooks[string, int]{Ended: func(string, error) { panic("ended hook") }},
 	}
-	held, err := g.Subscribe("held") // ended on a goroutine of Close's own
+	first, err := g.Subscribe("a")
 	x.NoError(err)
-	free, err := g.Subscribe("free") // ended on Close's goroutine
+	second, err := g.Subscribe("b")
 	x.NoError(err)
 
-	for _, key := range []string{"held", "free"} {
+	for _, key := range []string{"a", "b"} {
 		f := g.flights[key]
 		f.quitOnce.Do(func() { f.endByItself(errors.New("gone")) })
 	}
-	g.flights["held"].mu.Lock() // Close cannot have it at once
 
 	done := make(chan any, 1)
 	go func() {
 		defer func() { done <- recover() }()
 		_ = g.Close()
 	}()
-	time.Sleep(10 * time.Millisecond) // Close is waiting for the held key
-	g.flights["held"].mu.Unlock()
 
 	select {
 	case r := <-done:
 		x.Equal("ended hook", r, "the panic fails the Close it ran in")
 	case <-time.After(5 * time.Second):
-		x.Fail("Close never returned")
+		t.Fatal("Close never returned")
 	}
 	x.Equal(2, stops, "both upstreams were stopped")
 	x.Empty(g.flights, "and both keys given back")
 	x.NoError(g.Close(), "a later Close has nothing left to do")
-	x.NoError(held.Close())
-	x.NoError(free.Close())
+	x.NoError(first.Close())
+	x.NoError(second.Close())
 }
